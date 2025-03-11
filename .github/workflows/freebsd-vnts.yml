@@ -22,7 +22,7 @@ jobs:
           ref: ${{ env.BRANCH }} #默认使用master分支
       - name: 安装编译环境
         run: |
-          sudo apt-get update
+          #sudo apt-get update
           sudo apt-get install -y qemu qemu-user-static binfmt-support build-essential
           rustup target add x86_64-unknown-freebsd
           sed -i 's/const CLOCK_ID: ClockId = ClockId::CLOCK_BOOTTIME;/const CLOCK_ID: ClockId = ClockId::CLOCK_MONOTONIC;/g' ./lib/boringtun/src/sleepyinstant/unix.rs
