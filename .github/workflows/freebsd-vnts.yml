@@ -1,4 +1,4 @@
-name: Avnts-FreeBSD
+name: A编译vnts-FreeBSD
 
 on:
   workflow_dispatch:
