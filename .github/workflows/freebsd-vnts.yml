@@ -18,7 +18,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          repository: vnt-dev/vnts
+          repository: huangjin7511/vnts
           ref: ${{ env.BRANCH }} #默认使用master分支
       - name: 安装编译环境
         run: |
