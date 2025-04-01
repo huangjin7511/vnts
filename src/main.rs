@@ -177,10 +177,23 @@ async fn main() {
     let root_path = app_root();
     log_init(root_path.clone(), args.log_path);
     let port = args.port.unwrap_or(29872);
+    let udp_port = {
+        let udp_port = args.udp_port.unwrap_or(29870);
+        println!("端口: {}", udp_port);
+        if udp_port != 0 {
+            println!("tcp端口: {}", udp_port);
+            if udp_port == port {
+                panic!("udp-port == port");
+            }
+        } else {
+            println!("不启用udp")
+        }
+        udp_port
+    };
     #[cfg(feature = "web")]
     let web_port = {
         let web_port = args.web_port.unwrap_or(29870);
-        println!("端口: {}", port);
+        println!("端口: {}", web_port);
         if web_port != 0 {
             println!("web端口: {}", web_port);
             if web_port == port {
@@ -191,6 +204,7 @@ async fn main() {
         }
         web_port
     };
+    
 
     let white_token = args
         .white_token
@@ -302,9 +316,13 @@ async fn main() {
         }
     };
     log::info!("config:{:?}", config);
-    let udp = create_udp(port).unwrap();
-    log::info!("监听udp端口: {:?}", port);
-    println!("监听udp端口: {:?}", port);
+    let udp = if udp_port != 0 {
+        let udp = create_udp(udp_port).unwrap();
+        log::info!("监听udp端口: {:?}", udp_port);
+        println!("监听udp端口: {:?}", udp_port);
+    } else {
+        None
+    };
     let tcp = create_tcp(port).unwrap();
     log::info!("监听tcp/ws端口: {:?}", port);
     println!("监听tcp/ws端口: {:?}", port);
