@@ -35,7 +35,7 @@ pub struct StartArgs {
     #[arg(short, long)]
     port: Option<u16>,
     /// 指定udp端口，默认29872
-    #[arg(short, long)]
+    #[arg(short = 'u', long)]
     udp_port: Option<u16>,
     /// token白名单，例如 --white-token 1234 --white-token 123
     #[arg(short, long)]
