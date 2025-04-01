@@ -319,14 +319,11 @@ async fn main() {
         }
     };
     log::info!("config:{:?}", config);
-    let udp = if udp_port != 0 {
-        let udp = create_udp(udp_port).unwrap();
-        log::info!("监听udp端口: {:?}", udp_port);
-        println!("监听udp端口: {:?}", udp_port);
-        Some(udp)
-    } else {
-        None
-    };
+
+    let udp = create_udp(udp_port).unwrap();
+    log::info!("监听udp端口: {:?}", udp_port);
+    println!("监听udp端口: {:?}", udp_port);
+
     let tcp = create_tcp(port).unwrap();
     log::info!("监听tcp/ws端口: {:?}", port);
     println!("监听tcp/ws端口: {:?}", port);
