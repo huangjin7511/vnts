@@ -323,6 +323,7 @@ async fn main() {
         let udp = create_udp(udp_port).unwrap();
         log::info!("监听udp端口: {:?}", udp_port);
         println!("监听udp端口: {:?}", udp_port);
+        Some(udp)
     } else {
         None
     };
