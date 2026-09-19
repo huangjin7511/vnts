@@ -1,8 +1,18 @@
 use crate::ControlService;
-use crate::server::control_server::db::{ClientType, DeviceIpType, Ikev2InputRoute, NetworkType};
-use crate::server::control_server::service::{DeviceInfoVO, NetworkInfoVO};
+use crate::managed_config::{
+    ManagedClientConfigForm, canonicalize_client_config, canonicalize_stored_client_config,
+    editable_client_config, issue_subscription, managed_config_semantically_equal,
+    resolve_cert_mode, validate_managed_advanced_config,
+};
+use crate::server::control_server::db::{
+    self, ClientType, DeviceIpType, Ikev2InputRoute, ManagedConfigRecord, NetworkType,
+};
+use crate::server::control_server::service::{
+    DeviceInfoVO, NetworkInfoVO, SubscriptionLiveState, SubscriptionPushStatus,
+};
 use crate::utils::config::{
-    Ikev2Config, WireGuardConfig, load_ikev2_config, load_wireguard_config,
+    ClientAccessConfig, Ikev2Config, WireGuardConfig, load_ikev2_config, load_wireguard_config,
+    update_client_access_config as persist_client_access_config,
     update_ikev2_config as persist_ikev2_config, update_white_list as persist_white_list,
     update_wireguard_config as persist_wireguard_config, validate_network_code,
 };
@@ -99,6 +109,17 @@ struct AppState {
     auth_config: AuthConfig,
     config_path: Arc<PathBuf>,
     config_update_lock: Arc<tokio::sync::Mutex<()>>,
+    managed_device_update_locks: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    client_access: Arc<parking_lot::RwLock<ClientAccessConfig>>,
+    certificate_fingerprint: Arc<String>,
+    client_listener_ports: ClientListenerPorts,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+struct ClientListenerPorts {
+    tcp: Option<u16>,
+    quic: Option<u16>,
+    wss: Option<u16>,
 }
 
 #[derive(Clone)]
@@ -958,6 +979,869 @@ async fn download_ikev2_server_certificate(
         .into_response()
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ManagedConfigVO {
+    network_code: String,
+    device_id: String,
+    revision: i64,
+    config_toml: String,
+    advanced_config_toml: String,
+    applied_revision: i64,
+    status: String,
+    error: Option<String>,
+    overridden_fields: Vec<String>,
+    updated_at: i64,
+    subscription_issued: bool,
+    client_config: ManagedClientConfigForm,
+}
+
+impl ManagedConfigVO {
+    /// Sync state comes from the live subscription session when there is one;
+    /// without a session the server cannot know what the client runs and only
+    /// reports that it is (or is not) waiting for one.
+    fn from_record(
+        value: ManagedConfigRecord,
+        live: Option<SubscriptionLiveState>,
+    ) -> Self {
+        let subscription_issued = value.credential_key.is_some();
+        let client_config =
+            ManagedClientConfigForm::from_toml(&value.config_toml).unwrap_or_default();
+        let advanced_config_toml = editable_client_config(&value.config_toml).unwrap_or_default();
+        let (applied_revision, status, error, overridden_fields) = match live {
+            Some(live) => (
+                live.applied_revision as i64,
+                live.status(value.revision).to_string(),
+                live.apply_error(value.revision).map(str::to_string),
+                live.overridden_fields,
+            ),
+            None => (
+                0,
+                if subscription_issued {
+                    "awaiting_client"
+                } else {
+                    "not_connected_with_subscription"
+                }
+                .to_string(),
+                None,
+                Vec::new(),
+            ),
+        };
+        Self {
+            network_code: value.network_code,
+            device_id: value.device_id,
+            revision: value.revision,
+            config_toml: value.config_toml,
+            advanced_config_toml,
+            applied_revision,
+            status,
+            error,
+            overridden_fields,
+            updated_at: value.updated_at,
+            subscription_issued,
+            client_config,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ManagedConfigMutationResponse {
+    config: ManagedConfigVO,
+    push_status: SubscriptionPushStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subscription: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SubscriptionResponse {
+    subscription: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagedConfigRequest {
+    config_toml: Option<String>,
+    current_server: Option<String>,
+    other_servers: Option<Vec<String>>,
+    cert_mode: Option<String>,
+    client_config: Option<ManagedClientConfigForm>,
+    device_name: Option<String>,
+    ip: Option<String>,
+    ip_type: Option<DeviceIpType>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateManagedDeviceRequest {
+    network_code: String,
+    device_id: String,
+    device_name: String,
+    ip: String,
+    ip_type: Option<DeviceIpType>,
+    #[serde(default)]
+    config_toml: String,
+    current_server: Option<String>,
+    other_servers: Option<Vec<String>>,
+    cert_mode: Option<String>,
+    client_config: Option<ManagedClientConfigForm>,
+}
+
+#[derive(Deserialize)]
+struct ManagedIdentityConfig {
+    server: Vec<String>,
+    cert_mode: String,
+}
+
+fn unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn resolve_managed_device_ips(
+    current_ip: Option<&str>,
+    requested_ip: Option<&str>,
+) -> anyhow::Result<(Option<Ipv4Addr>, Ipv4Addr)> {
+    let current_ip = current_ip
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("设备当前 IP 无效"))?;
+    let target_ip = requested_ip
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("无效的 IP 地址"))?
+        .or(current_ip)
+        .ok_or_else(|| anyhow::anyhow!("请提供设备 IP 地址"))?;
+    Ok((current_ip, target_ip))
+}
+
+fn requested_servers(
+    current_server: Option<String>,
+    other_servers: Option<Vec<String>>,
+) -> anyhow::Result<Option<Vec<String>>> {
+    match current_server {
+        Some(current) => Ok(Some(
+            std::iter::once(current)
+                .chain(other_servers.unwrap_or_default())
+                .collect(),
+        )),
+        None if other_servers
+            .as_ref()
+            .is_some_and(|servers| !servers.is_empty()) =>
+        {
+            anyhow::bail!("填写其他服务器地址时必须同时填写当前服务器地址")
+        }
+        None => Ok(None),
+    }
+}
+
+fn requested_client_access(
+    state: &AppState,
+    server: Option<Vec<String>>,
+    cert_mode: Option<String>,
+) -> anyhow::Result<ClientAccessConfig> {
+    let defaults = state.client_access.read().clone();
+    let access = ClientAccessConfig {
+        server: server.unwrap_or(defaults.server),
+        cert_mode: cert_mode.unwrap_or(defaults.cert_mode),
+    };
+    access.validate()?;
+    Ok(access)
+}
+
+fn access_from_managed_toml(config_toml: &str) -> anyhow::Result<ClientAccessConfig> {
+    let value: ManagedIdentityConfig = toml::from_str(config_toml)?;
+    Ok(ClientAccessConfig {
+        server: value.server,
+        cert_mode: value.cert_mode,
+    })
+}
+
+fn draft_client_access() -> anyhow::Result<(ClientAccessConfig, String)> {
+    Ok((
+        ClientAccessConfig {
+            server: Vec::new(),
+            cert_mode: "finger".to_string(),
+        },
+        "finger".to_string(),
+    ))
+}
+
+fn new_draft_record(
+    state: &AppState,
+    network_code: &str,
+    device_id: &str,
+    device_name: &str,
+    configured_ip: Option<Ipv4Addr>,
+    is_fixed_ip: bool,
+) -> anyhow::Result<ManagedConfigRecord> {
+    let (access, resolved) = draft_client_access()?;
+    let config_toml = canonicalize_client_config("", &access, &resolved, device_name, is_fixed_ip)?;
+    let issued = if access.server.is_empty() {
+        None
+    } else {
+        Some(issue_subscription(
+            &access,
+            Some(state.certificate_fingerprint.as_str()),
+            network_code,
+            device_id,
+        )?)
+    };
+    Ok(ManagedConfigRecord {
+        network_code: network_code.to_string(),
+        device_id: device_id.to_string(),
+        revision: 1,
+        config_toml,
+        credential_key: issued.as_ref().map(|issued| issued.credential_key.clone()),
+        subscription: issued.as_ref().map(|issued| issued.subscription.clone()),
+        updated_at: unix_timestamp(),
+        configured_device_name: device_name.to_string(),
+        configured_ip,
+        fixed_ip: is_fixed_ip.then_some(configured_ip).flatten(),
+    })
+}
+
+#[derive(Serialize)]
+struct ClientAccessSettingsVO {
+    server: Vec<String>,
+    cert_mode: String,
+    listener_ports: ClientListenerPorts,
+}
+
+fn client_access_settings(state: &AppState) -> ClientAccessSettingsVO {
+    let config = state.client_access.read();
+    ClientAccessSettingsVO {
+        server: config.server.clone(),
+        cert_mode: config.cert_mode.clone(),
+        listener_ports: state.client_listener_ports,
+    }
+}
+
+async fn get_client_access(State(state): State<AppState>) -> ApiResponse<ClientAccessSettingsVO> {
+    ApiResponse::ok(client_access_settings(&state))
+}
+
+async fn update_client_access(
+    State(state): State<AppState>,
+    Json(body): Json<ClientAccessConfig>,
+) -> Response {
+    if let Err(error) = body.validate_optional() {
+        return ApiResponse::<()>::err(error.to_string()).into_response();
+    }
+    let _guard = state.config_update_lock.lock().await;
+    let path = state.config_path.as_ref().clone();
+    let persisted = body.clone();
+    match tokio::task::spawn_blocking(move || persist_client_access_config(&path, &persisted)).await
+    {
+        Ok(Ok(config)) => {
+            *state.client_access.write() = config.clone();
+            ApiResponse::ok(client_access_settings(&state)).into_response()
+        }
+        Ok(Err(error)) => ApiResponse::<()>::err(format!("保存配置失败: {error}")).into_response(),
+        Err(error) => ApiResponse::<()>::err(format!("保存配置任务失败: {error}")).into_response(),
+    }
+}
+
+async fn create_managed_device(
+    State(state): State<AppState>,
+    Json(body): Json<CreateManagedDeviceRequest>,
+) -> Response {
+    let ip: Ipv4Addr = match body.ip.parse() {
+        Ok(ip) => ip,
+        Err(_) => return ApiResponse::<()>::err("无效的 IP 地址").into_response(),
+    };
+    let ip_type = body.ip_type.unwrap_or(DeviceIpType::Dynamic);
+    let form_access = body
+        .client_config
+        .as_ref()
+        .map(|form| (form.servers(), form.cert_mode.clone()));
+    let request_server = match requested_servers(body.current_server, body.other_servers) {
+        Ok(value) => value.or_else(|| form_access.as_ref().map(|value| value.0.clone())),
+        Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+    };
+    let Some(request_server) = request_server else {
+        return ApiResponse::<()>::err("当前服务器地址不能为空").into_response();
+    };
+    let access = match requested_client_access(
+        &state,
+        Some(request_server),
+        body.cert_mode.or_else(|| form_access.map(|value| value.1)),
+    ) {
+        Ok(access) => access,
+        Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+    };
+    let resolved_cert_mode =
+        match resolve_cert_mode(&access, Some(state.certificate_fingerprint.as_str())) {
+            Ok(value) => value,
+            Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+        };
+    let mut stored_access = access.clone();
+    stored_access.cert_mode = resolved_cert_mode.clone();
+    let editable_toml = match body.client_config.as_ref() {
+        Some(form) => match form.merge_into_toml(&body.config_toml) {
+            Ok(value) => value,
+            Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+        },
+        None => body.config_toml.clone(),
+    };
+    if body.client_config.is_none()
+        && let Err(error) = validate_managed_advanced_config(&editable_toml)
+    {
+        return ApiResponse::<()>::err(error.to_string()).into_response();
+    }
+    let config_toml = match canonicalize_client_config(
+        &editable_toml,
+        &stored_access,
+        &resolved_cert_mode,
+        &body.device_name,
+        ip_type == DeviceIpType::Fixed,
+    ) {
+        Ok(value) => value,
+        Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+    };
+    let issued = match issue_subscription(
+        &stored_access,
+        Some(state.certificate_fingerprint.as_str()),
+        &body.network_code,
+        &body.device_id,
+    ) {
+        Ok(value) => value,
+        Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+    };
+    if let Err(error) = state
+        .control_service
+        .add_device_typed(
+            &body.network_code,
+            &body.device_id,
+            ip,
+            ip_type,
+            ClientType::Vnt,
+            None,
+            Some(body.device_name.clone()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    {
+        return ApiResponse::<()>::err(error.to_string()).into_response();
+    }
+    let record = ManagedConfigRecord {
+        network_code: body.network_code.clone(),
+        device_id: body.device_id.clone(),
+        revision: 1,
+        config_toml,
+        credential_key: Some(issued.credential_key.clone()),
+        subscription: Some(issued.subscription.clone()),
+        updated_at: unix_timestamp(),
+        configured_device_name: body.device_name,
+        configured_ip: Some(ip),
+        fixed_ip: (ip_type == DeviceIpType::Fixed).then_some(ip),
+    };
+    if let Err(error) = db::create_managed_config(&record).await {
+        // Keep the operation externally atomic even though the in-memory device
+        // registry and SQLite are maintained by separate components.
+        let _ = state
+            .control_service
+            .delete_device(&body.network_code, &body.device_id)
+            .await;
+        return ApiResponse::<()>::err(error.to_string()).into_response();
+    }
+    no_store(
+        ApiResponse::ok(ManagedConfigMutationResponse {
+            config: managed_config_vo_for(&state, &record).await,
+            push_status: SubscriptionPushStatus::NotConnected,
+            subscription: Some(issued.subscription),
+        })
+        .into_response(),
+    )
+}
+
+/// Builds the editor VO, attaching the device's live subscription sync state.
+async fn managed_config_vo_for(
+    state: &AppState,
+    record: &ManagedConfigRecord,
+) -> ManagedConfigVO {
+    let live = state
+        .control_service
+        .subscription_live_state(&record.network_code, &record.device_id);
+    ManagedConfigVO::from_record(record.clone(), live)
+}
+
+async fn get_managed_device_config(
+    State(state): State<AppState>,
+    Path((network_code, device_id)): Path<(String, String)>,
+) -> Response {
+    match db::get_managed_config(&network_code, &device_id).await {
+        Ok(Some(record)) => ApiResponse::ok(managed_config_vo_for(&state, &record).await)
+            .into_response(),
+        Ok(None) => {
+            let device = match state
+                .control_service
+                .get_device_record(&network_code, &device_id)
+                .await
+            {
+                Ok(Some(value)) if value.client_type == ClientType::Vnt => value,
+                Ok(Some(_)) => {
+                    return ApiResponse::<()>::err("只有 VNT 设备支持客户端配置").into_response();
+                }
+                Ok(None) => {
+                    return ApiResponse::<()>::err_code(404, "设备不存在").into_response();
+                }
+                Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+            };
+            let record = match new_draft_record(
+                &state,
+                &network_code,
+                &device_id,
+                &device.device_name,
+                device.ip.as_deref().and_then(|ip| ip.parse().ok()),
+                device.ip_type == DeviceIpType::Fixed,
+            ) {
+                Ok(value) => value,
+                Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+            };
+            match db::create_managed_config(&record).await {
+                Ok(()) => ApiResponse::ok(managed_config_vo_for(&state, &record).await)
+                    .into_response(),
+                Err(error) => ApiResponse::<()>::err(error.to_string()).into_response(),
+            }
+        }
+        Err(error) => ApiResponse::<()>::err(error.to_string()).into_response(),
+    }
+}
+
+async fn put_managed_device_config(
+    State(state): State<AppState>,
+    Path((network_code, device_id)): Path<(String, String)>,
+    Json(body): Json<ManagedConfigRequest>,
+) -> Response {
+    let mutation_lock = state
+        .managed_device_update_locks
+        .entry(format!("{network_code}\0{device_id}"))
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _mutation_guard = mutation_lock.lock().await;
+
+    let device = match state
+        .control_service
+        .get_device_record(&network_code, &device_id)
+        .await
+    {
+        Ok(Some(device)) if device.client_type == ClientType::Vnt => device,
+        Ok(Some(_)) => {
+            return ApiResponse::<()>::err("只有 VNT 设备支持客户端配置").into_response();
+        }
+        Ok(None) => return ApiResponse::<()>::err_code(404, "设备不存在").into_response(),
+        Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+    };
+    let current = match db::get_managed_config(&network_code, &device_id).await {
+        Ok(value) => value,
+        Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+    };
+    let (old_ip, target_ip) =
+        match resolve_managed_device_ips(device.ip.as_deref(), body.ip.as_deref()) {
+            Ok(value) => value,
+            Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+        };
+    let target_ip_type = body.ip_type.unwrap_or(device.ip_type);
+    let target_device_name = body
+        .device_name
+        .clone()
+        .unwrap_or_else(|| device.device_name.clone());
+    let base_changed = Some(target_ip) != old_ip
+        || target_ip_type != device.ip_type
+        || target_device_name != device.device_name;
+    let form_access = body
+        .client_config
+        .as_ref()
+        .map(|form| (form.servers(), form.cert_mode.clone()));
+    let request_server = match requested_servers(body.current_server, body.other_servers) {
+        Ok(value) => value.or_else(|| form_access.as_ref().map(|value| value.0.clone())),
+        Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+    };
+    let request_cert_mode = body.cert_mode.or_else(|| form_access.map(|value| value.1));
+    let existing_access = current
+        .as_ref()
+        .and_then(|record| access_from_managed_toml(&record.config_toml).ok())
+        .filter(|access| !access.server.is_empty());
+    let server =
+        request_server.or_else(|| existing_access.as_ref().map(|value| value.server.clone()));
+    let Some(server) = server else {
+        return ApiResponse::<()>::err("当前服务器地址不能为空").into_response();
+    };
+    let access = ClientAccessConfig {
+        server,
+        cert_mode: request_cert_mode
+            .or_else(|| existing_access.map(|value| value.cert_mode))
+            .unwrap_or_else(|| "finger".to_string()),
+    };
+    if let Err(error) = access.validate() {
+        return ApiResponse::<()>::err(error.to_string()).into_response();
+    };
+    let resolved = if access.server.is_empty() {
+        "standard".to_string()
+    } else {
+        match resolve_cert_mode(&access, Some(state.certificate_fingerprint.as_str())) {
+            Ok(value) => value,
+            Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+        }
+    };
+    let mut stored_access = access;
+    stored_access.cert_mode = resolved.clone();
+    let base_source = body.config_toml.as_deref().unwrap_or_else(|| {
+        current
+            .as_ref()
+            .map(|value| value.config_toml.as_str())
+            .unwrap_or("")
+    });
+    if body.client_config.is_none()
+        && body.config_toml.is_some()
+        && let Err(error) = validate_managed_advanced_config(base_source)
+    {
+        return ApiResponse::<()>::err(error.to_string()).into_response();
+    }
+    let structured_source;
+    let source = if let Some(form) = body.client_config.as_ref() {
+        structured_source = match form.merge_into_toml(base_source) {
+            Ok(value) => value,
+            Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+        };
+        structured_source.as_str()
+    } else {
+        base_source
+    };
+    let fixed_ip = (target_ip_type == DeviceIpType::Fixed).then_some(target_ip);
+    let normalized = match canonicalize_client_config(
+        source,
+        &stored_access,
+        &resolved,
+        &target_device_name,
+        fixed_ip.is_some(),
+    ) {
+        Ok(value) => value,
+        Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+    };
+    let previous = if let Some(current) = current.as_ref() {
+        let previous = match canonicalize_stored_client_config(
+            &current.config_toml,
+            &current.configured_device_name,
+            current.fixed_ip.is_some(),
+        ) {
+            Ok(value) => value,
+            Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+        };
+        Some(previous)
+    } else {
+        None
+    };
+
+    // Validation above is side-effect free. Only after the complete candidate
+    // is known to be valid do we change the authoritative device-table fields.
+    if base_changed
+        && let Err(error) = state
+            .control_service
+            .update_device_with_password(
+                &network_code,
+                &device_id,
+                target_ip,
+                target_ip_type,
+                None,
+                Some(target_device_name.clone()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+    {
+        return ApiResponse::<()>::err(error.to_string()).into_response();
+    }
+
+    let persist_result: anyhow::Result<(ManagedConfigRecord, bool)> = async {
+        if let Some(current) = current.as_ref() {
+            let semantic_equal = managed_config_semantically_equal(
+                previous.as_deref().unwrap_or_default(),
+                &normalized,
+            )?;
+            // Device-table IP is envelope metadata rather than TOML. It still
+            // changes the effective managed configuration and therefore must
+            // advance the revision for every allocation type.
+            if semantic_equal && !base_changed {
+                if current.config_toml == normalized {
+                    Ok((current.clone(), false))
+                } else {
+                    db::rewrite_managed_config(
+                        &network_code,
+                        &device_id,
+                        &normalized,
+                        unix_timestamp(),
+                    )
+                    .await?
+                    .map(|record| (record, false))
+                    .ok_or_else(|| anyhow::anyhow!("设备未启用服务端管理"))
+                }
+            } else {
+                db::update_managed_config(&network_code, &device_id, &normalized, unix_timestamp())
+                    .await?
+                    .map(|record| (record, true))
+                    .ok_or_else(|| anyhow::anyhow!("设备未启用服务端管理"))
+            }
+        } else {
+            let record = ManagedConfigRecord {
+                network_code: network_code.clone(),
+                device_id: device_id.clone(),
+                revision: 1,
+                config_toml: normalized.clone(),
+                credential_key: None,
+                subscription: None,
+                updated_at: unix_timestamp(),
+                configured_device_name: target_device_name.clone(),
+                configured_ip: Some(target_ip),
+                fixed_ip,
+            };
+            db::create_managed_config(&record).await?;
+            Ok((record, false))
+        }
+    }
+    .await;
+
+    let (record, should_push) = match persist_result {
+        Ok(result) => result,
+        Err(error) => {
+            if base_changed
+                && let Err(rollback_error) = state
+                    .control_service
+                    .restore_device_record(device.clone())
+                    .await
+            {
+                return ApiResponse::<()>::err(format!(
+                    "保存客户端配置失败: {error}; 恢复设备基础配置也失败: {rollback_error}"
+                ))
+                .into_response();
+            }
+            return ApiResponse::<()>::err(error.to_string()).into_response();
+        }
+    };
+    let push_status = if should_push {
+        match state
+            .control_service
+            .push_subscription_config(&record)
+            .await
+        {
+            Ok(status) => status,
+            Err(error) => {
+                // The revision is already durable. A malformed historical
+                // record must not be rolled back merely because it cannot be
+                // packaged for this connection; registration catch-up remains
+                // the recovery path after the record is repaired.
+                log::error!(
+                    "设备 {network_code}/{device_id} revision {} 的配置直推封包失败: {error:#}",
+                    record.revision
+                );
+                SubscriptionPushStatus::Closed
+            }
+        }
+    } else if current.is_some() {
+        SubscriptionPushStatus::Unchanged
+    } else {
+        SubscriptionPushStatus::NotConnected
+    };
+    ApiResponse::ok(ManagedConfigMutationResponse {
+        config: managed_config_vo_for(&state, &record).await,
+        push_status,
+        subscription: None,
+    })
+    .into_response()
+}
+
+async fn issue_missing_subscription(
+    State(state): State<AppState>,
+    Path((network_code, device_id)): Path<(String, String)>,
+) -> Response {
+    let device = match state
+        .control_service
+        .get_device_record(&network_code, &device_id)
+        .await
+    {
+        Ok(Some(value)) if value.client_type == ClientType::Vnt => value,
+        Ok(Some(_)) => return ApiResponse::<()>::err("只有 VNT 设备支持订阅链接").into_response(),
+        Ok(None) => return ApiResponse::<()>::err_code(404, "设备不存在").into_response(),
+        Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+    };
+    let (mut record, record_exists) = match db::get_managed_config(&network_code, &device_id).await
+    {
+        Ok(Some(value)) => (value, true),
+        Ok(None) => match new_draft_record(
+            &state,
+            &network_code,
+            &device_id,
+            &device.device_name,
+            device.ip.as_deref().and_then(|ip| ip.parse().ok()),
+            device.ip_type == DeviceIpType::Fixed,
+        ) {
+            Ok(value) => (value, false),
+            Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+        },
+        Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+    };
+    let access = match access_from_managed_toml(&record.config_toml)
+        .ok()
+        .filter(|access| !access.server.is_empty())
+    {
+        Some(value) => value,
+        None => return ApiResponse::<()>::err("请先配置当前服务器地址").into_response(),
+    };
+    let resolved = match resolve_cert_mode(&access, Some(state.certificate_fingerprint.as_str())) {
+        Ok(value) => value,
+        Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+    };
+    let mut stored_access = access.clone();
+    stored_access.cert_mode = resolved.clone();
+    let normalized = match canonicalize_client_config(
+        &record.config_toml,
+        &stored_access,
+        &resolved,
+        &device.device_name,
+        device.ip_type == DeviceIpType::Fixed,
+    ) {
+        Ok(value) => value,
+        Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+    };
+    let semantic_changed = match managed_config_semantically_equal(&record.config_toml, &normalized)
+    {
+        Ok(equal) => !equal,
+        Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+    };
+    let representation_changed = normalized != record.config_toml;
+    record.config_toml = normalized;
+    if !record_exists {
+        if let Err(error) = db::create_managed_config(&record).await {
+            return ApiResponse::<()>::err(error.to_string()).into_response();
+        }
+    } else if semantic_changed {
+        match db::update_managed_config(
+            &network_code,
+            &device_id,
+            &record.config_toml,
+            unix_timestamp(),
+        )
+        .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return ApiResponse::<()>::err_code(404, "设备配置不存在").into_response();
+            }
+            Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+        }
+    } else if representation_changed {
+        match db::rewrite_managed_config(
+            &network_code,
+            &device_id,
+            &record.config_toml,
+            unix_timestamp(),
+        )
+        .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return ApiResponse::<()>::err_code(404, "设备配置不存在").into_response();
+            }
+            Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+        }
+    }
+    let issued = match issue_subscription(
+        &access,
+        Some(state.certificate_fingerprint.as_str()),
+        &network_code,
+        &device_id,
+    ) {
+        Ok(value) => value,
+        Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+    };
+    match db::rotate_subscription_credentials(
+        &network_code,
+        &device_id,
+        &issued.credential_key,
+        &issued.subscription,
+        unix_timestamp(),
+    )
+    .await
+    {
+        Ok(true) => {
+            state
+                .control_service
+                .disconnect_subscription_session(&network_code, &device_id);
+            no_store(
+                ApiResponse::ok(SubscriptionResponse {
+                    subscription: issued.subscription,
+                })
+                .into_response(),
+            )
+        }
+        Ok(false) => ApiResponse::<()>::err_code(404, "设备未启用服务端管理").into_response(),
+        Err(error) => ApiResponse::<()>::err(error.to_string()).into_response(),
+    }
+}
+
+async fn get_subscription(
+    State(state): State<AppState>,
+    Path((network_code, device_id)): Path<(String, String)>,
+) -> Response {
+    let record = match db::get_managed_config(&network_code, &device_id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            let device = match state
+                .control_service
+                .get_device_record(&network_code, &device_id)
+                .await
+            {
+                Ok(Some(device)) if device.client_type == ClientType::Vnt => device,
+                Ok(Some(_)) => {
+                    return ApiResponse::<()>::err("只有 VNT 设备支持订阅链接").into_response();
+                }
+                Ok(None) => return ApiResponse::<()>::err_code(404, "设备不存在").into_response(),
+                Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+            };
+            let record = match new_draft_record(
+                &state,
+                &network_code,
+                &device_id,
+                &device.device_name,
+                device.ip.as_deref().and_then(|ip| ip.parse().ok()),
+                device.ip_type == DeviceIpType::Fixed,
+            ) {
+                Ok(record) => record,
+                Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+            };
+            if let Err(error) = db::create_managed_config(&record).await {
+                return ApiResponse::<()>::err(error.to_string()).into_response();
+            }
+            record
+        }
+        Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+    };
+    if let Some(subscription) = record.subscription {
+        return no_store(ApiResponse::ok(SubscriptionResponse { subscription }).into_response());
+    }
+    // A VNT device imported from the previous release receives its link on
+    // the first copy. That release had no vnt_device_configs table.
+    issue_missing_subscription(State(state), Path((network_code, device_id))).await
+}
+
+async fn disconnect_managed_device(
+    State(state): State<AppState>,
+    Path((network_code, device_id)): Path<(String, String)>,
+) -> ApiResponse<()> {
+    if state
+        .control_service
+        .disconnect_subscription_session(&network_code, &device_id)
+    {
+        ApiResponse::ok_msg("已断开订阅链接同步会话")
+    } else {
+        ApiResponse::ok_msg("设备当前没有订阅链接同步会话")
+    }
+}
+
 #[derive(Deserialize)]
 struct DeviceQueryParams {
     code: String,
@@ -1183,6 +2067,11 @@ struct CreateDeviceRequest {
     wireguard_output_subnets: Vec<ipnet::Ipv4Net>,
     #[serde(default)]
     wireguard_input_routes: Vec<Ikev2InputRoute>,
+    #[serde(default)]
+    config_toml: String,
+    current_server: Option<String>,
+    other_servers: Option<Vec<String>>,
+    cert_mode: Option<String>,
 }
 
 async fn create_device(
@@ -1193,14 +2082,35 @@ async fn create_device(
         Ok(ip) => ip,
         Err(_) => return ApiResponse::<()>::err("无效的 IP 地址").into_response(),
     };
+    let client_type = body.client_type;
+    let ip_type = body.ip_type.unwrap_or(DeviceIpType::Dynamic);
+    if client_type == ClientType::Vnt {
+        let device_name = body.device_name.unwrap_or_else(|| body.device_id.clone());
+        return create_managed_device(
+            State(state),
+            Json(CreateManagedDeviceRequest {
+                network_code: body.network_code,
+                device_id: body.device_id,
+                device_name,
+                ip: body.ip,
+                ip_type: Some(ip_type),
+                config_toml: body.config_toml,
+                current_server: body.current_server,
+                other_servers: body.other_servers,
+                cert_mode: body.cert_mode,
+                client_config: None,
+            }),
+        )
+        .await;
+    }
     match state
         .control_service
         .add_device_typed(
             &body.network_code,
             &body.device_id,
             ip,
-            body.ip_type.unwrap_or(DeviceIpType::Dynamic),
-            body.client_type,
+            ip_type,
+            client_type,
             body.ikev2_password,
             body.device_name,
             Some(body.ikev2_output_subnets),
@@ -1233,6 +2143,19 @@ async fn update_device(
     Path(device_id): Path<String>,
     Json(body): Json<UpdateDeviceRequest>,
 ) -> Response {
+    match state
+        .control_service
+        .get_device_record(&body.network_code, &device_id)
+        .await
+    {
+        Ok(Some(device)) if device.client_type == ClientType::Vnt => {
+            return ApiResponse::<()>::err("VNT 设备的名称和 IP 由客户端配置接口统一更新")
+                .into_response();
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => return ApiResponse::<()>::err_code(404, "设备不存在").into_response(),
+        Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+    }
     let ip: Ipv4Addr = match body.ip.parse() {
         Ok(ip) => ip,
         Err(_) => return ApiResponse::<()>::err("无效的 IP 地址").into_response(),
@@ -1382,12 +2305,16 @@ fn safe_static_path(path: &str) -> Option<PathBuf> {
     Some(StdPath::new("static").join(relative))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_http_server(
     control_service: ControlService,
     username: String,
     password: String,
     web_bind: SocketAddr,
     config_path: PathBuf,
+    client_access: ClientAccessConfig,
+    certificate_fingerprint: String,
+    client_listener_ports: (Option<u16>, Option<u16>, Option<u16>),
 ) -> anyhow::Result<()> {
     let jwt_secret: String = rand::rng()
         .sample_iter(&Alphanumeric)
@@ -1406,6 +2333,14 @@ pub async fn start_http_server(
         auth_config,
         config_path: Arc::new(config_path),
         config_update_lock: Arc::new(tokio::sync::Mutex::new(())),
+        managed_device_update_locks: Arc::new(dashmap::DashMap::new()),
+        client_access: Arc::new(parking_lot::RwLock::new(client_access)),
+        certificate_fingerprint: Arc::new(certificate_fingerprint),
+        client_listener_ports: ClientListenerPorts {
+            tcp: client_listener_ports.0,
+            quic: client_listener_ports.1,
+            wss: client_listener_ports.2,
+        },
     };
 
     let app = build_app(app_state);
@@ -1446,6 +2381,18 @@ fn build_app(app_state: AppState) -> Router {
         .route("/devices", post(create_device))
         .route("/devices", delete(delete_device))
         .route("/devices/{device_id}", put(update_device))
+        .route(
+            "/networks/{network_code}/devices/{device_id}/client-config",
+            get(get_managed_device_config).put(put_managed_device_config),
+        )
+        .route(
+            "/networks/{network_code}/devices/{device_id}/subscription",
+            get(get_subscription),
+        )
+        .route(
+            "/networks/{network_code}/devices/{device_id}/disconnect",
+            post(disconnect_managed_device),
+        )
         .route("/peer_servers", get(list_peer_servers))
         .route("/peer_servers", post(add_peer_server))
         .route("/peer_servers/{server_addr}", delete(delete_peer_server))
@@ -1460,6 +2407,10 @@ fn build_app(app_state: AppState) -> Router {
         .route(
             "/settings/wireguard",
             get(get_wireguard_settings).put(update_wireguard_settings),
+        )
+        .route(
+            "/settings/client-access",
+            get(get_client_access).put(update_client_access),
         )
         .route_layer(middleware::from_fn_with_state(
             app_state.clone(),
@@ -1477,11 +2428,12 @@ fn build_app(app_state: AppState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, AuthConfig, Claims, build_app, normalize_network_codes, safe_static_path,
+        AppState, AuthConfig, Claims, ClientListenerPorts, build_app, draft_client_access,
+        normalize_network_codes, requested_servers, resolve_managed_device_ips, safe_static_path,
     };
     use crate::server::control_server::db::{ClientType, DeviceIpType, Ikev2InputRoute};
     use crate::server::control_server::service::ControlService;
-    use crate::utils::config::{Ikev2Config, update_ikev2_config};
+    use crate::utils::config::{ClientAccessConfig, Ikev2Config, update_ikev2_config};
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode, header};
     use jsonwebtoken::{EncodingKey, Header};
@@ -1525,6 +2477,46 @@ mod tests {
         assert!(normalize_network_codes(vec![" alpha".to_string()]).is_err());
     }
 
+    #[test]
+    fn managed_endpoints_keep_current_first_and_require_it_for_other_addresses() {
+        assert_eq!(
+            requested_servers(
+                Some("tcp://vpn.example.com:29872".to_string()),
+                Some(vec![
+                    "quic://vpn.example.com:29872".to_string(),
+                    "wss://vpn.example.com:443".to_string(),
+                ]),
+            )
+            .unwrap()
+            .unwrap(),
+            vec![
+                "tcp://vpn.example.com:29872".to_string(),
+                "quic://vpn.example.com:29872".to_string(),
+                "wss://vpn.example.com:443".to_string(),
+            ]
+        );
+        assert!(
+            requested_servers(None, Some(vec!["quic://vpn.example.com:29872".to_string()]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unconfigured_device_draft_defaults_to_fingerprint_validation() {
+        let (access, resolved) = draft_client_access().unwrap();
+        assert!(access.server.is_empty());
+        assert_eq!(access.cert_mode, "finger");
+        assert_eq!(resolved, "finger");
+    }
+
+    #[test]
+    fn managed_device_update_accepts_a_requested_ip_after_dynamic_lease_expiry() {
+        let (current_ip, target_ip) = resolve_managed_device_ips(None, Some("10.26.0.33")).unwrap();
+        assert_eq!(current_ip, None);
+        assert_eq!(target_ip.to_string(), "10.26.0.33");
+        assert!(resolve_managed_device_ips(None, None).is_err());
+    }
+
     #[tokio::test]
     async fn whitelist_settings_routes_require_auth_and_update_config_and_runtime() {
         let directory = tempfile::tempdir().unwrap();
@@ -1552,6 +2544,10 @@ mod tests {
             },
             config_path: Arc::new(config_path.clone()),
             config_update_lock: Arc::new(tokio::sync::Mutex::new(())),
+            managed_device_update_locks: Arc::new(dashmap::DashMap::new()),
+            client_access: Arc::new(parking_lot::RwLock::new(ClientAccessConfig::default())),
+            certificate_fingerprint: Arc::new("0".repeat(64)),
+            client_listener_ports: ClientListenerPorts::default(),
         });
 
         let unauthorized = app
@@ -1621,6 +2617,10 @@ mod tests {
             },
             config_path: Arc::new(directory.path().join("missing/config.toml")),
             config_update_lock: Arc::new(tokio::sync::Mutex::new(())),
+            managed_device_update_locks: Arc::new(dashmap::DashMap::new()),
+            client_access: Arc::new(parking_lot::RwLock::new(ClientAccessConfig::default())),
+            certificate_fingerprint: Arc::new("0".repeat(64)),
+            client_listener_ports: ClientListenerPorts::default(),
         });
         let failed_update = app_with_unwritable_config
             .oneshot(
@@ -1687,6 +2687,10 @@ mod tests {
             },
             config_path: Arc::new(config_path),
             config_update_lock: Arc::new(tokio::sync::Mutex::new(())),
+            managed_device_update_locks: Arc::new(dashmap::DashMap::new()),
+            client_access: Arc::new(parking_lot::RwLock::new(ClientAccessConfig::default())),
+            certificate_fingerprint: Arc::new("0".repeat(64)),
+            client_listener_ports: ClientListenerPorts::default(),
         });
         let token = jsonwebtoken::encode(
             &Header::default(),
@@ -1800,6 +2804,10 @@ persistent_keepalive = 25
             },
             config_path: Arc::new(config_path),
             config_update_lock: Arc::new(tokio::sync::Mutex::new(())),
+            managed_device_update_locks: Arc::new(dashmap::DashMap::new()),
+            client_access: Arc::new(parking_lot::RwLock::new(ClientAccessConfig::default())),
+            certificate_fingerprint: Arc::new("0".repeat(64)),
+            client_listener_ports: ClientListenerPorts::default(),
         });
         let token = jsonwebtoken::encode(
             &Header::default(),
@@ -1905,6 +2913,10 @@ persistent_keepalive = 25
             },
             config_path: Arc::new(config_path),
             config_update_lock: Arc::new(tokio::sync::Mutex::new(())),
+            managed_device_update_locks: Arc::new(dashmap::DashMap::new()),
+            client_access: Arc::new(parking_lot::RwLock::new(ClientAccessConfig::default())),
+            certificate_fingerprint: Arc::new("0".repeat(64)),
+            client_listener_ports: ClientListenerPorts::default(),
         });
         let token = jsonwebtoken::encode(
             &Header::default(),
@@ -1997,6 +3009,10 @@ persistent_keepalive = 25
             },
             config_path: Arc::new(config_path.clone()),
             config_update_lock: Arc::new(tokio::sync::Mutex::new(())),
+            managed_device_update_locks: Arc::new(dashmap::DashMap::new()),
+            client_access: Arc::new(parking_lot::RwLock::new(ClientAccessConfig::default())),
+            certificate_fingerprint: Arc::new("0".repeat(64)),
+            client_listener_ports: ClientListenerPorts::default(),
         });
         let token = jsonwebtoken::encode(
             &Header::default(),

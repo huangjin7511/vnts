@@ -31,6 +31,104 @@ pub struct ConfigFile {
     pub server_token: Option<String>,
     pub ikev2: Option<Ikev2Config>,
     pub wireguard: Option<WireGuardConfig>,
+    #[serde(default)]
+    pub client_access: ClientAccessConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ClientAccessConfig {
+    /// Public VNT endpoints embedded in newly issued subscriptions.
+    #[serde(default)]
+    pub server: Vec<String>,
+    /// `standard`, `finger`, or `finger:<sha256>`. `finger` is resolved to the
+    /// certificate fingerprint when a subscription is issued.
+    #[serde(default = "default_client_cert_mode")]
+    pub cert_mode: String,
+}
+
+fn default_client_cert_mode() -> String {
+    "finger".to_string()
+}
+
+impl Default for ClientAccessConfig {
+    fn default() -> Self {
+        Self {
+            server: Vec::new(),
+            cert_mode: default_client_cert_mode(),
+        }
+    }
+}
+
+impl ClientAccessConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.server.is_empty() {
+            anyhow::bail!("client_access.server 至少需要一个公网服务端地址");
+        }
+        self.validate_optional()
+    }
+
+    pub fn validate_optional(&self) -> anyhow::Result<()> {
+        let mut unique = HashSet::new();
+        for endpoint in &self.server {
+            let trimmed = endpoint.trim();
+            if trimmed.is_empty() || endpoint != trimmed {
+                anyhow::bail!("client_access.server 包含无效地址");
+            }
+            validate_client_endpoint(trimmed)?;
+            if !unique.insert(trimmed) {
+                anyhow::bail!("client_access.server 包含重复地址");
+            }
+        }
+        let cert_mode = self.cert_mode.as_str();
+        let valid_fingerprint = cert_mode
+            .strip_prefix("finger:")
+            .is_some_and(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()));
+        if cert_mode != "standard" && cert_mode != "finger" && !valid_fingerprint {
+            anyhow::bail!("client_access.cert_mode 只能是 standard、finger 或 finger:<sha256>");
+        }
+        Ok(())
+    }
+}
+
+fn validate_client_endpoint(endpoint: &str) -> anyhow::Result<()> {
+    let authority = ["tcp://", "quic://", "wss://"]
+        .into_iter()
+        .find_map(|scheme| endpoint.strip_prefix(scheme))
+        .ok_or_else(|| anyhow::anyhow!("客户端接入地址仅支持 tcp://、quic:// 或 wss://"))?;
+    if authority.is_empty()
+        || authority.bytes().any(|byte| byte.is_ascii_whitespace())
+        || authority.contains(['/', '?', '#', '@'])
+    {
+        anyhow::bail!("客户端接入地址格式无效，必须包含主机和端口");
+    }
+    if let Ok(address) = authority.parse::<SocketAddr>() {
+        if address.port() == 0 {
+            anyhow::bail!("客户端接入端口不能为 0");
+        }
+        return Ok(());
+    }
+    // A bracketed IPv6 authority should have parsed as SocketAddr above.
+    if authority.starts_with('[') || authority.contains(']') {
+        anyhow::bail!("客户端接入 IPv6 地址格式无效");
+    }
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("客户端接入地址必须包含端口"))?;
+    if host.is_empty()
+        || host.contains(':')
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        anyhow::bail!("客户端接入主机名无效");
+    }
+    let port: u16 = port
+        .parse()
+        .map_err(|_| anyhow::anyhow!("客户端接入端口无效"))?;
+    if port == 0 {
+        anyhow::bail!("客户端接入端口不能为 0");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -109,6 +207,7 @@ impl Default for ConfigFile {
             server_token: None,
             ikev2: None,
             wireguard: None,
+            client_access: ClientAccessConfig::default(),
         }
     }
 }
@@ -150,6 +249,9 @@ impl ConfigFile {
         if let Some(wireguard) = &self.wireguard {
             wireguard.validate()?;
         }
+        // An empty endpoint list is allowed at process startup so existing
+        // installations remain compatible. Managed-device creation validates it.
+        self.client_access.validate_optional()?;
         Ok(())
     }
 }
@@ -306,6 +408,32 @@ pub fn load_ikev2_config(path: &Path) -> anyhow::Result<Option<Ikev2Config>> {
 
 pub fn load_wireguard_config(path: &Path) -> anyhow::Result<Option<WireGuardConfig>> {
     Ok(ConfigFile::load_from(Some(path.to_path_buf()))?.wireguard)
+}
+
+pub fn update_client_access_config(
+    path: &Path,
+    config: &ClientAccessConfig,
+) -> anyhow::Result<ClientAccessConfig> {
+    config.validate_optional()?;
+    let content = std::fs::read_to_string(path)?;
+    let mut document = content.parse::<DocumentMut>()?;
+    if !document.contains_key("client_access") {
+        document["client_access"] = Item::Table(Table::new());
+    }
+    let table = document["client_access"]
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("client_access 必须是表"))?;
+    let mut servers = Array::new();
+    for endpoint in &config.server {
+        servers.push(endpoint.as_str());
+    }
+    insert_value(table, "server", Value::Array(servers));
+    insert_value(table, "cert_mode", Value::from(config.cert_mode.clone()));
+    let rendered = document.to_string();
+    let parsed: ConfigFile = toml::from_str(&rendered)?;
+    parsed.client_access.validate_optional()?;
+    persist_document(path, rendered)?;
+    Ok(parsed.client_access)
 }
 
 pub fn update_wireguard_config(
@@ -507,10 +635,44 @@ key = "key.pem"
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigFile, Ikev2Config, load_ikev2_config, load_wireguard_config, update_ikev2_config,
-        update_white_list, update_wireguard_config, validate_network_code,
+        ClientAccessConfig, ConfigFile, Ikev2Config, load_ikev2_config, load_wireguard_config,
+        update_ikev2_config, update_white_list, update_wireguard_config, validate_network_code,
     };
     use std::collections::HashSet;
+
+    #[test]
+    fn client_access_requires_a_supported_host_and_nonzero_port() {
+        for endpoint in [
+            "tcp://vpn.example.com:29872",
+            "quic://192.0.2.10:443",
+            "wss://[2001:db8::1]:29872",
+        ] {
+            assert!(
+                ClientAccessConfig {
+                    server: vec![endpoint.to_string()],
+                    cert_mode: "finger".to_string(),
+                }
+                .validate()
+                .is_ok()
+            );
+        }
+        for endpoint in [
+            "http://vpn.example.com:29872",
+            "tcp://vpn.example.com",
+            "tcp://vpn.example.com:0",
+            "tcp://2001:db8::1:29872",
+            "tcp://vpn.example.com:29872/path",
+        ] {
+            assert!(
+                ClientAccessConfig {
+                    server: vec![endpoint.to_string()],
+                    cert_mode: "finger".to_string(),
+                }
+                .validate()
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn missing_white_list_and_custom_nets_use_empty_defaults() {

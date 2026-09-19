@@ -14,6 +14,9 @@ importers:
       qrcode:
         specifier: ^1.5.4
         version: 1.5.4
+      smol-toml:
+        specifier: ^1.8.0
+        version: 1.8.0
       vue:
         specifier: ^3.5.41
         version: 3.5.42(typescript@6.0.3)
@@ -736,6 +739,10 @@ packages:
 
   set-blocking@2.0.0:
     resolution: {integrity: sha512-KiKBS8AnWGEyLzofFfmvKwpdPzqiy16LvQfK3yv/fVH7Bj13/wl3JSR1J+rfgRE9q7xUJK4qvgS8raSOeLUehw==}
+
+  smol-toml@1.8.0:
+    resolution: {integrity: sha512-kCZr2V3ch9i00x8zXRhjUNVcjG9ijES5dDudkXvUVCT5QlJNQWElSJdZqyPemffHoLNUYwOcou0Fy+ojN0uHSQ==}
+    engines: {node: '>= 18'}
 
   source-map-js@1.2.1:
     resolution: {integrity: sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA==}
@@ -1477,6 +1484,8 @@ snapshots:
   scule@1.3.0: {}
 
   set-blocking@2.0.0: {}
+
+  smol-toml@1.8.0: {}
 
   source-map-js@1.2.1: {}
 

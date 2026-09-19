@@ -1,7 +1,7 @@
 use crate::protocol::control_message::{
     ClientSimpleInfoList, ConfirmRegResponseMsg, ErrorResponseMsg, FastRegRequestMsg,
     FastRegResponseMsg, RegResponseMsg, RequestMessage, ResponseMessage, SelectiveBroadcast,
-    SubnetSyncRequest, SubnetSyncResponse,
+    SubnetSyncRequest, SubnetSyncResponse, SubscriptionConfigAck,
 };
 use crate::protocol::ip_packet_protocol::{HEAD_LENGTH, MsgType, NetPacket};
 use crate::protocol::rpc_message::rpc_message_request::RpcReqPayload;
@@ -44,14 +44,36 @@ impl ControlHandler {
             bail!("Session is already active");
         }
         let request = RequestMessage::from_slice(buf)?;
-        let reg = match request {
-            RequestMessage::Reg(reg) => reg,
-            _ => bail!("Expected registration request"),
-        };
-        log::info!("addr={},{:?}", self.addr, reg);
         let Some(sender) = self.sender.upgrade() else {
             bail!("Sender is already dropped");
         };
+        let reg = match request {
+            RequestMessage::Reg(reg) => reg,
+            RequestMessage::SubscriptionConfig(request) => {
+                let response = match self
+                    .control_service
+                    .fetch_subscription_config(request)
+                    .await
+                {
+                    Ok(config) => ResponseMessage::SubscriptionConfig(config),
+                    Err(error) => ResponseMessage::Error(ErrorResponseMsg {
+                        code: 403,
+                        message: error.to_string(),
+                    }),
+                };
+                sender.send(Bytes::from(response.encode())).await?;
+                return Ok(());
+            }
+            _ => bail!("Expected registration or subscription configuration request"),
+        };
+        // Do not Debug-log registration requests: managed registrations contain
+        // a reusable access token.
+        log::info!(
+            "registration request addr={}, network_code={}, device_id={}",
+            self.addr,
+            reg.network_code,
+            reg.device_id
+        );
         let registration_mode = reg.registration_mode;
         let session = match self.control_service.register(reg, sender.clone()).await {
             Ok(session) => session,
@@ -81,9 +103,21 @@ impl ControlHandler {
             gateway: session.network_state.gateway(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             subnet_sync_supported: true,
+            subscription_config_supported: true,
+            subscription: session.subscription_server_proof.clone(),
+            server_instance_id: self.control_service.server_instance_id(),
+            multi_link_supported: true,
         };
         let vec = ResponseMessage::Reg(reg_msg_response).encode();
         sender.send(Bytes::from(vec)).await?;
+        if let Some((network_code, device_id)) = session.subscription_identity.clone()
+            && let Err(error) = self
+                .control_service
+                .activate_subscription_session(&network_code, &device_id, session.random_id)
+                .await
+        {
+            log::warn!("设备 {network_code}/{device_id} 注册后的受管配置补发失败: {error:#}");
+        }
         Ok(())
     }
 
@@ -167,16 +201,6 @@ impl ControlHandler {
         Ok(buf.freeze())
     }
 
-    fn update_ip_packet(ip: Ipv4Addr) -> Option<Bytes> {
-        let mut buf = BytesMut::zeroed(HEAD_LENGTH + 4);
-        let mut packet = NetPacket::new(&mut buf).ok()?;
-        packet.set_msg_type(MsgType::UpdateIp);
-        packet.set_gateway_flag(true);
-        packet.set_ttl(1);
-        packet.set_payload(&ip.octets()).ok()?;
-        Some(buf.freeze())
-    }
-
     pub async fn handle_gateway(&mut self, mut buf: BytesMut) -> anyhow::Result<()> {
         let mut packet = NetPacket::new(&mut buf)?;
         let msg_type = packet.msg_type()?;
@@ -204,12 +228,6 @@ impl ControlHandler {
             }
 
             MsgType::PingTurn => {
-                if let Some(latest_ip) = session.network_state.configured_ip(&session.device_id)
-                    && latest_ip != session.ip
-                    && let Some(update) = Self::update_ip_packet(latest_ip)
-                {
-                    _ = sender.try_send(update);
-                }
                 if packet.payload().len() == 8 {
                     packet.set_msg_type(MsgType::PongTurn);
                     _ = sender.try_send(buf.freeze());
@@ -288,7 +306,12 @@ impl ControlHandler {
                     let latency_ms = (rtt / 2) as u32;
                     self.control_service
                         .get_network_state_provider()
-                        .update_client_latency(&session.network_code, session.ip, latency_ms);
+                        .update_client_latency(
+                            &session.network_code,
+                            session.ip,
+                            session.random_id,
+                            latency_ms,
+                        );
 
                     log::debug!(
                         "Client latency updated: network_code={}, ip={}, latency={} ms",
@@ -317,24 +340,53 @@ impl ControlHandler {
                     _ = sender.try_send(response);
                 }
             }
+            MsgType::SubscriptionConfigAck => {
+                if session.subscription_server_proof.is_none() {
+                    log::debug!("忽略未通过订阅链接验证的配置确认");
+                } else if let Some((network_code, device_id)) = &session.subscription_identity {
+                    let ack = SubscriptionConfigAck::from_slice(packet.payload())?;
+                    let capabilities = self
+                        .control_service
+                        .acknowledge_subscription_config(
+                            network_code,
+                            device_id,
+                            session.random_id,
+                            ack,
+                        )
+                        .await?;
+                    if let Some((allow_ikev2, allow_wireguard)) = capabilities
+                        && let Some(session) = self.session.as_mut()
+                    {
+                        session.allow_ikev2 = allow_ikev2;
+                        session.allow_wireguard = allow_wireguard;
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
     }
 
     pub async fn handle_data(&mut self, buf: BytesMut) -> anyhow::Result<()> {
-        if let Some(session) = self.session.as_ref() {
-            if session.registration_status == RegistrationStatus::PendingConfirmation {
-                if let Ok(request) = RequestMessage::from_slice(&buf)
-                    && matches!(request, RequestMessage::ConfirmReg(_))
-                {
-                    return self.handle_confirm_reg().await;
-                }
-                log::debug!("Ignoring data in pre-registration state");
-                return Ok(());
-            }
-        } else {
+        let Some(session) = self.session.as_mut() else {
             bail!("Session is not active");
+        };
+        let Some(active_ip) = session.network_state.active_link_ip(
+            session.ip,
+            &session.client_instance_id,
+            session.random_id,
+        ) else {
+            bail!("Session has been replaced by another client instance");
+        };
+        session.ip = active_ip;
+        if session.registration_status == RegistrationStatus::PendingConfirmation {
+            if let Ok(request) = RequestMessage::from_slice(&buf)
+                && matches!(request, RequestMessage::ConfirmReg(_))
+            {
+                return self.handle_confirm_reg().await;
+            }
+            log::debug!("Ignoring data in pre-registration state");
+            return Ok(());
         }
 
         let mut buf = buf;
@@ -487,7 +539,7 @@ impl ControlHandler {
                 if !packet.decr_ttl() {
                     return Ok(());
                 }
-                let list: Vec<Sender<Bytes>> = session
+                let list: Vec<_> = session
                     .network_state
                     .sender_map()
                     .iter()
@@ -508,7 +560,7 @@ impl ControlHandler {
                     return Ok(());
                 }
                 let buf = Bytes::from(packet.into_buffer());
-                let list: Vec<Sender<Bytes>> = session
+                let list: Vec<_> = session
                     .network_state
                     .sender_map()
                     .iter()
@@ -528,7 +580,7 @@ impl ControlHandler {
                     return Ok(());
                 }
                 let buf = Bytes::from(packet.into_buffer());
-                let list: Vec<Sender<Bytes>> = session
+                let list: Vec<_> = session
                     .network_state
                     .sender_map()
                     .iter()
@@ -698,17 +750,6 @@ mod tests {
         let buf = gateway_ping_packet(28, 5);
         let packet = NetPacket::new(buf).expect("net packet");
         assert!(ControlHandler::handle_icmp_ping(&packet).is_some());
-    }
-
-    #[test]
-    fn update_ip_packet_uses_type_16_and_network_order_ipv4_payload() {
-        let ip = "10.26.0.9".parse().unwrap();
-        let bytes = ControlHandler::update_ip_packet(ip).expect("update packet");
-        let packet = NetPacket::new(bytes).expect("net packet");
-        assert_eq!(packet.msg_type().unwrap(), MsgType::UpdateIp);
-        assert!(packet.is_gateway());
-        assert_eq!(packet.ttl(), 1);
-        assert_eq!(packet.payload(), &[10, 26, 0, 9]);
     }
 
     #[test]

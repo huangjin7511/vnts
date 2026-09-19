@@ -746,6 +746,8 @@ mod tests {
                     advertised_subnets: Vec::new(),
                     allow_ikev2: false,
                     allow_wireguard: false,
+                    subscription: None,
+                    client_instance_id: Vec::new(),
                 },
                 sender,
             )

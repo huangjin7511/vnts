@@ -1,4 +1,12 @@
-use crate::protocol::control_message::{RegRequestMsg, RegistrationMode};
+use crate::managed_config::{
+    canonicalize_stored_client_config, client_proof, constant_time_hash_eq,
+    managed_config_semantically_equal, server_proof,
+};
+use crate::protocol::control_message::{
+    RegRequestMsg, RegistrationMode, SubscriptionConfigAck, SubscriptionConfigApplyStatus,
+    SubscriptionConfigEnvelope, SubscriptionConfigFetchRequest, SubscriptionRegistration,
+    SubscriptionServerProof,
+};
 use crate::server::control_server::db;
 use crate::server::control_server::db::{
     ClientType, DeviceIpType, Ikev2InputRoute, NetworkRecord, NetworkSource, NetworkType,
@@ -15,17 +23,35 @@ use ipnet::Ipv4Net;
 use parking_lot::RwLock;
 use rand::RngCore;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::mpsc::Sender;
-use tokio::time::{Duration, Instant};
+use tokio::time::{Duration, Instant, timeout};
+
+const SUBSCRIPTION_PUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistrationStatus {
     Confirmed,
     PendingConfirmation,
+}
+
+/// Result of attempting to place a managed-configuration revision on the
+/// currently connected subscription session's outbound queue. `Queued` is a
+/// transport boundary only: the client still reports actual application by
+/// sending a configuration acknowledgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionPushStatus {
+    Queued,
+    NotConnected,
+    Registering,
+    Timeout,
+    Closed,
+    Unchanged,
 }
 
 #[derive(Clone, Copy)]
@@ -76,8 +102,150 @@ fn network_from_gateway(gateway: Ipv4Addr, netmask: u8) -> anyhow::Result<Ipv4Ne
     Ok(net)
 }
 
+fn authenticate_managed_access(
+    config: Option<&db::ManagedConfigRecord>,
+    registration: Option<&SubscriptionRegistration>,
+) -> Option<SubscriptionServerProof> {
+    let registration = registration?;
+    let encoded = config?.credential_key.as_deref()?;
+    let credential_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .ok()
+        .filter(|value| value.len() == 32)?;
+    if registration.client_nonce.len() != 32
+        || registration.client_proof.len() != 32
+        || registration.instance_id.len() != 32
+    {
+        return None;
+    }
+    let expected = client_proof(&credential_key, &registration.client_nonce);
+    if !constant_time_hash_eq(&expected, &registration.client_proof) {
+        return None;
+    };
+    let mut server_nonce = vec![0_u8; 32];
+    rand::rng().fill_bytes(&mut server_nonce);
+    Some(SubscriptionServerProof {
+        server_proof: server_proof(&credential_key, &registration.client_nonce, &server_nonce),
+        server_nonce,
+        target_revision: config?.revision as u64,
+    })
+}
+
+fn validate_subscription_identity(
+    reg_req: &RegRequestMsg,
+    registration: Option<&SubscriptionRegistration>,
+) -> anyhow::Result<Option<(String, String)>> {
+    let Some(registration) = registration else {
+        return Ok(None);
+    };
+    if registration.network_code != reg_req.network_code
+        || registration.device_id != reg_req.device_id
+    {
+        bail!(
+            "订阅身份与注册身份不一致: subscription={}/{}, registration={}/{}",
+            registration.network_code,
+            registration.device_id,
+            reg_req.network_code,
+            reg_req.device_id
+        );
+    }
+    Ok(Some((
+        registration.network_code.clone(),
+        registration.device_id.clone(),
+    )))
+}
+
+fn validate_registered_revision(applied_revision: u64, server_revision: i64) -> anyhow::Result<()> {
+    if applied_revision > server_revision as u64 {
+        bail!(
+            "客户端受管配置 revision {} 超过服务端 revision {}",
+            applied_revision,
+            server_revision
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct SubscriptionSessionEntry {
+    instance_id: Vec<u8>,
+    client_instance_id: Vec<u8>,
+    runtime_network_code: String,
+    ip: Ipv4Addr,
+    /// Device-scoped sync state reported by this client run. Registration
+    /// seeds it and config ACKs keep it current. It deliberately dies with
+    /// the session: the durable record only stores the server-authored
+    /// revision, never a snapshot of what the client last ran.
+    applied_revision: u64,
+    apply_error: Option<(u64, String)>,
+    overridden_fields: Vec<String>,
+    links: HashMap<u64, SubscriptionSessionLink>,
+}
+
+#[derive(Clone)]
+struct SubscriptionSessionLink {
+    sender: Sender<Bytes>,
+    server_proof: SubscriptionServerProof,
+    /// False only until RegResponse has entered the same reliable outbound
+    /// queue. It protects protocol ordering and is never controlled by an ACK.
+    registration_complete: bool,
+}
+
+/// Sync state observed on a device's live subscription session.
+#[derive(Clone, Debug)]
+pub struct SubscriptionLiveState {
+    pub applied_revision: u64,
+    apply_error: Option<(u64, String)>,
+    pub overridden_fields: Vec<String>,
+}
+
+impl SubscriptionLiveState {
+    /// Failure reason reported for `target_revision`. It is hidden once the
+    /// durable record advances past the revision the client failed to apply.
+    pub fn apply_error(&self, target_revision: i64) -> Option<&str> {
+        let (revision, error) = self.apply_error.as_ref()?;
+        (*revision == target_revision as u64).then_some(error.as_str())
+    }
+
+    pub fn status(&self, target_revision: i64) -> &'static str {
+        if self.applied_revision >= target_revision as u64 {
+            "applied"
+        } else if self.apply_error(target_revision).is_some() {
+            "error"
+        } else {
+            "pending"
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SubscriptionSessionTarget {
+    runtime_network_code: String,
+    ip: Ipv4Addr,
+    sender: Sender<Bytes>,
+    server_proof: SubscriptionServerProof,
+    applied_revision: u64,
+}
+
+impl SubscriptionSessionEntry {
+    fn target(&self, require_complete: bool) -> Option<SubscriptionSessionTarget> {
+        self.links
+            .iter()
+            .filter(|(_, link)| !require_complete || link.registration_complete)
+            .map(|(_, link)| SubscriptionSessionTarget {
+                runtime_network_code: self.runtime_network_code.clone(),
+                ip: self.ip,
+                sender: link.sender.clone(),
+                server_proof: link.server_proof.clone(),
+                applied_revision: self.applied_revision,
+            })
+            .next()
+    }
+}
+
 #[derive(Clone)]
 pub struct ControlService {
+    server_instance_id: Arc<Vec<u8>>,
     default_net: Ipv4Net,
     default_gateway: Ipv4Addr,
     default_lease_duration: Duration,
@@ -86,6 +254,7 @@ pub struct ControlService {
     network_state_provider: NetworkStateProvider,
     network_init_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     device_mutation_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    subscription_sessions: Arc<DashMap<(String, String), SubscriptionSessionEntry>>,
     ikev2_device_mutation_lock: Arc<tokio::sync::Mutex<()>>,
     wireguard_device_mutation_lock: Arc<tokio::sync::Mutex<()>>,
     peer_manager: Arc<RwLock<Option<Arc<crate::server::peer_server::PeerServerManager>>>>,
@@ -111,6 +280,11 @@ impl ControlService {
         let db_nets = Self::merge_network_configs(Self::load_networks_from_db().await, config_nets);
 
         let service = Self {
+            server_instance_id: Arc::new({
+                let mut value = vec![0_u8; 32];
+                rand::rng().fill_bytes(&mut value);
+                value
+            }),
             default_net,
             default_gateway,
             default_lease_duration: lease_duration,
@@ -119,6 +293,7 @@ impl ControlService {
             network_state_provider: NetworkStateProvider::new(network_states),
             network_init_locks: Arc::new(DashMap::new()),
             device_mutation_locks: Arc::new(DashMap::new()),
+            subscription_sessions: Arc::new(DashMap::new()),
             ikev2_device_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             wireguard_device_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             peer_manager: Arc::new(RwLock::new(None)),
@@ -133,8 +308,85 @@ impl ControlService {
             .min(lease_duration / 2)
             .max(Duration::from_secs(10));
         service.start_cleanup_task(cleanup_interval);
+        service.migrate_managed_config_representation().await;
 
         Ok(service)
+    }
+
+    pub fn server_instance_id(&self) -> Vec<u8> {
+        self.server_instance_id.as_ref().clone()
+    }
+
+    async fn migrate_managed_config_representation(&self) {
+        let records = match db::list_managed_configs().await {
+            Ok(records) => records,
+            Err(error) => {
+                log::error!("读取历史受管配置以执行规范化迁移失败: {error:#}");
+                return;
+            }
+        };
+        for record in records {
+            let canonical = match canonicalize_stored_client_config(
+                &record.config_toml,
+                &record.configured_device_name,
+                record.fixed_ip.is_some(),
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    log::error!(
+                        "设备 {}/{} revision {} 的历史受管配置无效，未迁移且不会下发: {error:#}",
+                        record.network_code,
+                        record.device_id,
+                        record.revision
+                    );
+                    continue;
+                }
+            };
+            if canonical == record.config_toml {
+                continue;
+            }
+            let semantic_equal =
+                match managed_config_semantically_equal(&record.config_toml, &canonical) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        log::error!(
+                            "设备 {}/{} revision {} 的历史受管配置无法比较: {error:#}",
+                            record.network_code,
+                            record.device_id,
+                            record.revision
+                        );
+                        continue;
+                    }
+                };
+            let result = if semantic_equal {
+                db::rewrite_managed_config(
+                    &record.network_code,
+                    &record.device_id,
+                    &canonical,
+                    record.updated_at,
+                )
+                .await
+            } else {
+                db::update_managed_config(
+                    &record.network_code,
+                    &record.device_id,
+                    &canonical,
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64,
+                )
+                .await
+            };
+            if let Err(error) = result {
+                log::error!(
+                    "设备 {}/{} revision {} 的历史受管配置规范化写回失败: {error:#}",
+                    record.network_code,
+                    record.device_id,
+                    record.revision
+                );
+            }
+        }
     }
 
     fn build_config_networks(
@@ -262,6 +514,21 @@ impl ControlService {
         let registration_mode = reg_req.registration_mode;
         let allow_ikev2 = reg_req.allow_ikev2;
         let allow_wireguard = reg_req.allow_wireguard;
+        let subscription_registration = (client_type == ClientType::Vnt)
+            .then(|| reg_req.subscription.clone())
+            .flatten();
+        let claimed_subscription_identity =
+            validate_subscription_identity(&reg_req, subscription_registration.as_ref())?;
+        let managed_config =
+            if let Some((managed_network, managed_device)) = &claimed_subscription_identity {
+                db::get_managed_config(managed_network, managed_device).await?
+            } else {
+                None
+            };
+        let mut subscription_server_proof = authenticate_managed_access(
+            managed_config.as_ref(),
+            subscription_registration.as_ref(),
+        );
         if !self.network_code_allowed(&network_code) {
             bail!("network_code '{}' is not in white_list", network_code);
         }
@@ -286,6 +553,30 @@ impl ControlService {
             .get_or_create_network_state(reg_req.network_code.clone(), config)
             .await;
 
+        if let (Some(identity), Some(registration)) = (
+            claimed_subscription_identity.as_ref(),
+            subscription_registration.as_ref(),
+        ) && self
+            .subscription_sessions
+            .get(identity)
+            .is_some_and(|session| {
+                session.instance_id.as_slice() != registration.instance_id.as_slice()
+            })
+        {
+            subscription_server_proof = None;
+        }
+        // Presence of an unverified subscription extension must not change
+        // ordinary session behaviour before subscription authentication.
+        let subscription_identity = subscription_server_proof
+            .as_ref()
+            .and_then(|_| claimed_subscription_identity.clone());
+        if subscription_identity.is_some()
+            && let (Some(record), Some(registration)) =
+                (managed_config.as_ref(), subscription_registration.as_ref())
+        {
+            validate_registered_revision(registration.applied_revision, record.revision)?;
+        }
+
         let existing = state.get_device_entry(&reg_req.device_id);
         if existing
             .as_ref()
@@ -307,15 +598,69 @@ impl ControlService {
         let (session, entry) = {
             let random_id = rand::rng().next_u64();
             let device_id = reg_req.device_id.clone();
+            let client_instance_id = reg_req.client_instance_id.clone();
 
-            let (ip, _old_ip, entry) =
-                match state.allocate_ip_and_get_entry_as(reg_req, random_id, sender, client_type) {
-                    Ok(rs) => rs,
-                    Err(e) => {
-                        log::warn!("network_code={network_code},device_id={device_id},e={e:?}");
-                        return Err(e);
-                    }
+            let managed_sender = sender.clone();
+            let (ip, _old_ip, entry) = match state.allocate_ip_and_get_entry_as(
+                reg_req,
+                random_id,
+                sender,
+                client_type,
+                client_instance_id.clone(),
+            ) {
+                Ok(rs) => rs,
+                Err(e) => {
+                    log::warn!("network_code={network_code},device_id={device_id},e={e:?}");
+                    return Err(e);
+                }
+            };
+
+            if let (Some(identity), Some(registration), Some(_)) = (
+                subscription_identity.clone(),
+                subscription_registration.as_ref(),
+                subscription_server_proof.as_ref(),
+            ) {
+                let link = SubscriptionSessionLink {
+                    sender: managed_sender,
+                    server_proof: subscription_server_proof.clone().expect("checked proof"),
+                    registration_complete: false,
                 };
+                let appended = if !client_instance_id.is_empty() {
+                    self.subscription_sessions
+                        .get_mut(&identity)
+                        .is_some_and(|mut current| {
+                            if current.instance_id == registration.instance_id
+                                && current.client_instance_id == client_instance_id
+                            {
+                                current.ip = ip;
+                                current.applied_revision = current
+                                    .applied_revision
+                                    .max(registration.applied_revision);
+                                current.links.insert(random_id, link.clone());
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                } else {
+                    false
+                };
+                if !appended {
+                    self.subscription_sessions.insert(
+                        identity,
+                        SubscriptionSessionEntry {
+                            instance_id: registration.instance_id.clone(),
+                            client_instance_id: client_instance_id.clone(),
+                            runtime_network_code: network_code.clone(),
+                            ip,
+                            applied_revision: registration.applied_revision,
+                            apply_error: None,
+                            overridden_fields: Vec::new(),
+                            links: HashMap::from([(random_id, link)]),
+                        },
+                    );
+                }
+            }
 
             (
                 Session {
@@ -323,6 +668,7 @@ impl ControlService {
                     device_id: device_id.clone(),
                     ip,
                     random_id,
+                    client_instance_id,
                     network_state: state.clone(),
                     registration_status: match registration_mode {
                         RegistrationMode::Normal => RegistrationStatus::Confirmed,
@@ -330,6 +676,9 @@ impl ControlService {
                     },
                     allow_ikev2,
                     allow_wireguard,
+                    subscription_identity,
+                    subscription_server_proof,
+                    subscription_sessions: self.subscription_sessions.clone(),
                 },
                 entry,
             )
@@ -365,6 +714,310 @@ impl ControlService {
         }
 
         Ok(session)
+    }
+
+    pub async fn fetch_subscription_config(
+        &self,
+        request: SubscriptionConfigFetchRequest,
+    ) -> anyhow::Result<SubscriptionConfigEnvelope> {
+        let record = db::get_managed_config(&request.network_code, &request.device_id)
+            .await?
+            .filter(|record| record.credential_key.is_some())
+            .ok_or_else(|| anyhow::anyhow!("设备尚未生成订阅链接，或已被删除"))?;
+        if request.client_nonce.len() != 32 || request.client_proof.len() != 32 {
+            bail!("订阅链接客户端证明无效");
+        }
+        let credential_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(
+                record
+                    .credential_key
+                    .as_deref()
+                    .context("订阅链接凭据不存在")?,
+            )
+            .context("订阅链接凭据无效")?;
+        if credential_key.len() != 32 {
+            bail!("订阅链接凭据长度无效");
+        }
+        let expected = client_proof(&credential_key, &request.client_nonce);
+        if !constant_time_hash_eq(&expected, &request.client_proof) {
+            bail!("订阅链接凭据无效或已被重新签发");
+        }
+        let mut server_nonce = vec![0_u8; 32];
+        rand::rng().fill_bytes(&mut server_nonce);
+        let proof = SubscriptionServerProof {
+            server_proof: server_proof(&credential_key, &request.client_nonce, &server_nonce),
+            server_nonce,
+            target_revision: record.revision as u64,
+        };
+        self.subscription_envelope(&record, proof)
+    }
+
+    pub fn subscription_envelope(
+        &self,
+        record: &db::ManagedConfigRecord,
+        proof: SubscriptionServerProof,
+    ) -> anyhow::Result<SubscriptionConfigEnvelope> {
+        let toml = canonicalize_stored_client_config(
+            &record.config_toml,
+            &record.configured_device_name,
+            record.fixed_ip.is_some(),
+        )
+        .with_context(|| {
+            format!(
+                "设备 {}/{} revision {} 的配置无法规范化",
+                record.network_code, record.device_id, record.revision
+            )
+        })?;
+        let managed_ip = record.configured_ip.context("受管设备未配置目标 IP")?;
+        let managed_prefix_len = self
+            .db_nets
+            .read()
+            .get(&record.network_code)
+            .copied()
+            .context("受管设备所属网络不存在")?
+            .net
+            .prefix_len();
+        let source_server_id = hex::encode(self.server_instance_id.as_ref());
+        let mut content = Sha256::new();
+        content.update(toml.as_bytes());
+        content.update(managed_ip.octets());
+        content.update([managed_prefix_len]);
+        content.update(record.configured_device_name.as_bytes());
+        let content_sha256 = content.finalize().to_vec();
+        Ok(SubscriptionConfigEnvelope {
+            revision: record.revision as u64,
+            toml,
+            managed_ip,
+            managed_prefix_len,
+            managed_device_name: record.configured_device_name.clone(),
+            server_proof: proof,
+            network_code: record.network_code.clone(),
+            device_id: record.device_id.clone(),
+            source_server_id,
+            content_sha256,
+        })
+    }
+
+    pub async fn acknowledge_subscription_config(
+        &self,
+        network_code: &str,
+        device_id: &str,
+        random_id: u64,
+        ack: SubscriptionConfigAck,
+    ) -> anyhow::Result<Option<(bool, bool)>> {
+        let identity = (network_code.to_string(), device_id.to_string());
+        if !self
+            .subscription_sessions
+            .get(&identity)
+            .is_some_and(|entry| entry.links.contains_key(&random_id))
+        {
+            bail!("订阅配置回执会话已失效");
+        }
+        if ack.status == SubscriptionConfigApplyStatus::SubscriptionConfigSuperseded {
+            log::debug!(
+                "设备 {network_code}/{device_id} 跳过已被更高版本替代的 revision {}",
+                ack.revision
+            );
+            return Ok(None);
+        }
+        // Older clients sent APPLIED without the extended runtime fields. Protobuf decodes those
+        // absent fields as empty/false, so only a hashed effective snapshot may replace live state.
+        let has_runtime_metadata = has_effective_runtime_metadata(&ack);
+        if ack.status == SubscriptionConfigApplyStatus::SubscriptionConfigApplied
+            && has_runtime_metadata
+            && (ack.effective_config_sha256.len() != 32
+                || ack.effective_device_name.is_empty()
+                || ack.effective_device_name.trim() != ack.effective_device_name
+                || ack.effective_device_name.len() > RegRequestMsg::MAX_NAME_LEN
+                || ack.effective_output.len() > 256)
+        {
+            bail!("订阅配置回执中的运行时元数据无效");
+        }
+        // The durable record stores only the server-authored revision; the
+        // reported sync state lives in the session entry below.
+        let Some(record) = db::get_managed_config(network_code, device_id).await? else {
+            bail!("订阅链接配置确认的设备未启用服务端管理");
+        };
+        let ack_revision = ack.revision as i64;
+        if ack_revision > record.revision {
+            bail!("订阅链接配置确认的 revision {} 无效", ack.revision);
+        }
+        // A stale ACK for a superseded revision must not describe the current
+        // target, so only an ACK matching the durable revision updates state.
+        if ack_revision == record.revision
+            && let Some(mut entry) = self.subscription_sessions.get_mut(&identity)
+        {
+            if ack.status == SubscriptionConfigApplyStatus::SubscriptionConfigApplied {
+                entry.applied_revision = entry.applied_revision.max(ack.revision);
+            }
+            entry.apply_error = (!ack.error.is_empty())
+                .then(|| (ack.revision, ack.error.clone()));
+            entry.overridden_fields = ack.overridden_fields.clone();
+        }
+        let applied_session =
+            if ack.status == SubscriptionConfigApplyStatus::SubscriptionConfigApplied {
+                self.subscription_sessions
+                    .get(&identity)
+                    .and_then(|entry| entry.target(false))
+            } else {
+                None
+            };
+        let mut runtime_capabilities = None;
+        if let Some(session) = applied_session
+            && has_runtime_metadata
+        {
+            if !ack.effective_ip.is_unspecified() && ack.effective_ip != session.ip {
+                log::warn!(
+                    "忽略设备 {network_code}/{device_id} 回执中的不匹配 IP {}，会话 IP 为 {}",
+                    ack.effective_ip,
+                    session.ip
+                );
+            }
+            if let Some(state) = self.get_network_state(&session.runtime_network_code)
+                && let Some(record) = state.update_managed_runtime_metadata(
+                    device_id,
+                    &ack.effective_device_name,
+                    ack.effective_output.clone(),
+                    ack.allow_ikev2,
+                    ack.allow_wireguard,
+                )
+                && let Err(error) = db::save_or_update_device(&record).await
+            {
+                log::error!(
+                    "持久化设备 {network_code}/{device_id} 的受管运行时元数据失败: {error:#}"
+                );
+            }
+            runtime_capabilities = Some((ack.allow_ikev2, ack.allow_wireguard));
+        }
+        Ok(runtime_capabilities)
+    }
+
+    /// Marks a managed session ready only after RegResponse has entered the
+    /// reliable outbound queue, then catches it up from the durable record.
+    pub async fn activate_subscription_session(
+        &self,
+        network_code: &str,
+        device_id: &str,
+        random_id: u64,
+    ) -> anyhow::Result<()> {
+        let identity = (network_code.to_string(), device_id.to_string());
+        let session = {
+            let Some(mut entry) = self.subscription_sessions.get_mut(&identity) else {
+                return Ok(());
+            };
+            let had_complete = entry.links.values().any(|link| link.registration_complete);
+            let Some(link) = entry.links.get_mut(&random_id) else {
+                return Ok(());
+            };
+            link.registration_complete = true;
+            if had_complete {
+                return Ok(());
+            }
+            entry.target(true).expect("activated subscription link")
+        };
+        let Some(record) = db::get_managed_config(network_code, device_id).await? else {
+            return Ok(());
+        };
+        if record.revision as u64 <= session.applied_revision {
+            return Ok(());
+        }
+        let status = self.enqueue_subscription_config(&record, &session).await?;
+        if status != SubscriptionPushStatus::Queued {
+            log::debug!("设备 {network_code}/{device_id} 的注册配置补发未入队: {status:?}");
+        }
+        Ok(())
+    }
+
+    pub async fn push_subscription_config(
+        &self,
+        record: &db::ManagedConfigRecord,
+    ) -> anyhow::Result<SubscriptionPushStatus> {
+        let identity = (record.network_code.clone(), record.device_id.clone());
+        let session = {
+            let Some(entry) = self.subscription_sessions.get(&identity) else {
+                return Ok(SubscriptionPushStatus::NotConnected);
+            };
+            let Some(target) = entry.target(true) else {
+                return Ok(SubscriptionPushStatus::Registering);
+            };
+            target
+        };
+        self.enqueue_subscription_config(record, &session).await
+    }
+
+    async fn enqueue_subscription_config(
+        &self,
+        record: &db::ManagedConfigRecord,
+        session: &SubscriptionSessionTarget,
+    ) -> anyhow::Result<SubscriptionPushStatus> {
+        use crate::protocol::ip_packet_protocol::{HEAD_LENGTH, MsgType, NetPacket};
+        let mut proof = session.server_proof.clone();
+        proof.target_revision = record.revision as u64;
+        let payload = self.subscription_envelope(record, proof)?.encode();
+        let mut bytes = BytesMut::zeroed(HEAD_LENGTH + payload.len());
+        let mut packet = NetPacket::new(&mut bytes)?;
+        packet.set_msg_type(MsgType::SubscriptionConfigPush);
+        packet.set_gateway_flag(true);
+        packet.set_ttl(1);
+        packet.set_payload(&payload)?;
+        Ok(Self::enqueue_subscription_payload(
+            &session.sender,
+            bytes.freeze(),
+            SUBSCRIPTION_PUSH_TIMEOUT,
+        )
+        .await)
+    }
+
+    async fn enqueue_subscription_payload(
+        sender: &Sender<Bytes>,
+        payload: Bytes,
+        wait: Duration,
+    ) -> SubscriptionPushStatus {
+        // Waiting for bounded-queue capacity is event driven.  A timeout or a
+        // closed channel never rolls back the durable revision; registration
+        // catch-up will send that revision again when the client reconnects.
+        match timeout(wait, sender.send(payload)).await {
+            Ok(Ok(())) => SubscriptionPushStatus::Queued,
+            Ok(Err(error)) => {
+                log::debug!("订阅配置推送连接已关闭，将在客户端重连后补发: {error}");
+                SubscriptionPushStatus::Closed
+            }
+            Err(_) => {
+                log::debug!(
+                    "订阅配置推送等待发送队列超过 {} 秒，将在客户端重连后补发",
+                    wait.as_secs()
+                );
+                SubscriptionPushStatus::Timeout
+            }
+        }
+    }
+
+    pub fn disconnect_subscription_session(&self, network_code: &str, device_id: &str) -> bool {
+        let Some((_, session)) = self
+            .subscription_sessions
+            .remove(&(network_code.to_string(), device_id.to_string()))
+        else {
+            return false;
+        };
+        let Some(state) = self.get_network_state(&session.runtime_network_code) else {
+            return false;
+        };
+        state.sender_map().remove(&session.ip).is_some()
+    }
+
+    /// Live sync observation for a device's subscription session, if any.
+    pub fn subscription_live_state(
+        &self,
+        network_code: &str,
+        device_id: &str,
+    ) -> Option<SubscriptionLiveState> {
+        self.subscription_sessions
+            .get(&(network_code.to_string(), device_id.to_string()))
+            .map(|entry| SubscriptionLiveState {
+                applied_revision: entry.applied_revision,
+                apply_error: entry.apply_error.clone(),
+                overridden_fields: entry.overridden_fields.clone(),
+            })
     }
 
     pub async fn register_ikev2(
@@ -403,6 +1056,8 @@ impl ControlService {
             advertised_subnets: device.advertised_subnets,
             allow_ikev2: true,
             allow_wireguard: true,
+            subscription: None,
+            client_instance_id: Vec::new(),
         };
         self.register_inner(request, sender, ClientType::Ikev2)
             .await
@@ -443,6 +1098,8 @@ impl ControlService {
             advertised_subnets: entry.advertised_subnets,
             allow_ikev2: true,
             allow_wireguard: true,
+            subscription: None,
+            client_instance_id: Vec::new(),
         };
         self.register_inner(request, sender, ClientType::Wireguard)
             .await
@@ -631,7 +1288,7 @@ impl ControlService {
 
                         let timestamp_bytes = timestamp.to_be_bytes();
                         if packet.set_payload(&timestamp_bytes).is_ok() {
-                            let _ = sender.try_send(buf.freeze());
+                            sender.try_send_all(buf.freeze());
                         }
                     }
                 }
@@ -997,9 +1654,6 @@ impl ControlService {
                 if ikev2_password.is_some() {
                     bail!("VNT 设备不能配置 IKEv2 密码");
                 }
-                if device_name.is_some() {
-                    bail!("VNT 设备不能配置设备名称");
-                }
                 None
             }
             ClientType::Ikev2 => {
@@ -1052,9 +1706,8 @@ impl ControlService {
             (None, None)
         };
         let device_name = match client_type {
-            ClientType::Vnt => existing
-                .as_ref()
-                .map(|entry| entry.device_name.clone())
+            ClientType::Vnt => device_name
+                .or_else(|| existing.as_ref().map(|entry| entry.device_name.clone()))
                 .unwrap_or_else(|| device_id.to_string()),
             ClientType::Ikev2 | ClientType::Wireguard => device_name
                 .or_else(|| existing.as_ref().map(|entry| entry.device_name.clone()))
@@ -1326,6 +1979,25 @@ impl ControlService {
         db::get_device(network_code, device_id).await
     }
 
+    pub async fn restore_device_record(&self, record: db::DeviceRecord) -> anyhow::Result<()> {
+        let network_code = record.network_code.clone();
+        let mutation_lock = self
+            .device_mutation_locks
+            .entry(network_code.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = mutation_lock.lock().await;
+        let config = self
+            .db_nets
+            .read()
+            .get(&network_code)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("网络编号 '{}' 不存在", network_code))?;
+        let state = self.get_or_create_network_state(network_code, config).await;
+        state.restore_device_record(record.clone());
+        db::save_or_update_device(&record).await
+    }
+
     pub async fn fast_register(
         &self,
         session: &mut Session,
@@ -1342,8 +2014,22 @@ impl ControlService {
             session.ip,
             new_ip,
             session.random_id,
+            &session.client_instance_id,
         )?;
         session.ip = new_ip;
+        // A non-Fixed FastReg can be accepted by a secondary VNTS before that
+        // endpoint has received the management edit. Persist its converged
+        // device-table address so a subsequent local restart does not restore
+        // the stale address for this live session.
+        if let Some(record) = session.network_state.get_device_entry(&session.device_id) {
+            db::save_or_update_device(&record.to_record(&session.network_code)).await?;
+        }
+        if let Some(identity) = &session.subscription_identity
+            && let Some(mut managed_session) = self.subscription_sessions.get_mut(identity)
+            && managed_session.links.contains_key(&session.random_id)
+        {
+            managed_session.ip = new_ip;
+        }
         Ok(())
     }
 
@@ -1729,6 +2415,7 @@ impl ControlService {
                     .map(|r| DeviceInfoVO {
                         device_id: r.device_id,
                         device_name: r.device_name,
+                        current_device_name: None,
                         device_version: r.device_version,
                         ip: r.ip.as_ref().and_then(|s| s.parse().ok()),
                         current_ip: None,
@@ -1748,6 +2435,13 @@ impl ControlService {
                         tx_bytes: r.tx_bytes as u64,
                         rx_bytes: r.rx_bytes as u64,
                         client_type: r.client_type,
+                        managed: false,
+                        subscription_session: false,
+                        subscription_issued: false,
+                        subscription_target_revision: None,
+                        subscription_applied_revision: None,
+                        subscription_status: None,
+                        subscription_error: None,
                     })
                     .collect(),
                 Err(e) => {
@@ -1764,6 +2458,7 @@ impl ControlService {
                 devices.push(DeviceInfoVO {
                     device_id: format!("remote-{}", ip),
                     device_name: format!("Remote Device ({})", ip),
+                    current_device_name: None,
                     device_version: "Unknown".to_string(),
                     ip: Some(ip),
                     current_ip: None,
@@ -1781,7 +2476,44 @@ impl ControlService {
                     tx_bytes: 0,
                     rx_bytes: 0,
                     client_type,
+                    managed: false,
+                    subscription_session: false,
+                    subscription_issued: false,
+                    subscription_target_revision: None,
+                    subscription_applied_revision: None,
+                    subscription_status: None,
+                    subscription_error: None,
                 });
+            }
+        }
+
+        for device in &mut devices {
+            if device.client_type != ClientType::Vnt || device.device_id.starts_with("remote-") {
+                continue;
+            }
+            if let Ok(Some(managed)) = db::get_managed_config(network_code, &device.device_id).await
+            {
+                device.managed = true;
+                device.subscription_issued = managed.credential_key.is_some();
+                device.subscription_target_revision = Some(managed.revision);
+                // Sync state is an observation of the live subscription
+                // session; without one the server cannot know what the
+                // client runs.
+                match self.subscription_live_state(network_code, &device.device_id) {
+                    Some(live) => {
+                        device.subscription_session = true;
+                        device.subscription_applied_revision = Some(live.applied_revision as i64);
+                        device.subscription_status = Some(live.status(managed.revision).to_string());
+                        device.subscription_error =
+                            live.apply_error(managed.revision).map(str::to_string);
+                    }
+                    None => {
+                        device.subscription_session = false;
+                        device.subscription_applied_revision = None;
+                        device.subscription_status = None;
+                        device.subscription_error = None;
+                    }
+                }
             }
         }
 
@@ -1794,19 +2526,39 @@ pub struct Session {
     pub device_id: String,
     pub ip: Ipv4Addr,
     pub random_id: u64,
+    pub client_instance_id: Vec<u8>,
     pub network_state: Arc<NetworkState>,
     pub registration_status: RegistrationStatus,
     pub allow_ikev2: bool,
     pub allow_wireguard: bool,
+    pub subscription_identity: Option<(String, String)>,
+    pub subscription_server_proof: Option<SubscriptionServerProof>,
+    subscription_sessions: Arc<DashMap<(String, String), SubscriptionSessionEntry>>,
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if let Some(identity) = &self.subscription_identity {
+            let remove_entry =
+                self.subscription_sessions
+                    .get_mut(identity)
+                    .is_some_and(|mut session| {
+                        session.links.remove(&self.random_id);
+                        session.links.is_empty()
+                    });
+            if remove_entry {
+                self.subscription_sessions
+                    .remove_if(identity, |_, session| session.links.is_empty());
+            }
+        }
         match self.registration_status {
             RegistrationStatus::Confirmed => {
-                let record =
-                    self.network_state
-                        .offline_ip(&self.device_id, self.ip, self.random_id);
+                let record = self.network_state.offline_ip(
+                    &self.device_id,
+                    self.ip,
+                    self.random_id,
+                    &self.client_instance_id,
+                );
                 if let Some(record) = record {
                     tokio::spawn(async move {
                         if let Err(e) = db::save_or_update_device(&record).await {
@@ -1826,6 +2578,7 @@ impl Drop for Session {
                     &self.device_id,
                     self.ip,
                     self.random_id,
+                    &self.client_instance_id,
                 );
             }
         }
@@ -1836,6 +2589,7 @@ impl Drop for Session {
 pub struct DeviceInfoVO {
     pub device_id: String,
     pub device_name: String,
+    pub current_device_name: Option<String>,
     pub device_version: String,
     pub ip: Option<Ipv4Addr>,
     pub current_ip: Option<Ipv4Addr>,
@@ -1853,6 +2607,14 @@ pub struct DeviceInfoVO {
     pub tx_bytes: u64,
     pub rx_bytes: u64,
     pub client_type: ClientType,
+    pub managed: bool,
+    #[serde(rename = "subscription_session")]
+    pub subscription_session: bool,
+    pub subscription_issued: bool,
+    pub subscription_target_revision: Option<i64>,
+    pub subscription_applied_revision: Option<i64>,
+    pub subscription_status: Option<String>,
+    pub subscription_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1872,20 +2634,246 @@ fn network_counts(memory_counts: Option<(u32, u32)>, persisted_count: Option<u32
     memory_counts.unwrap_or((persisted_count.unwrap_or(0), 0))
 }
 
+fn has_effective_runtime_metadata(ack: &SubscriptionConfigAck) -> bool {
+    !ack.effective_config_sha256.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlService, NetworkConfig, first_usable_ip, network_counts, network_from_gateway,
+        ControlService, NetworkConfig, SubscriptionPushStatus, SubscriptionSessionEntry,
+        SubscriptionSessionLink, authenticate_managed_access, first_usable_ip,
+        has_effective_runtime_metadata, network_counts, network_from_gateway,
+        validate_registered_revision, validate_subscription_identity,
     };
-    use crate::protocol::control_message::{RegRequestMsg, RegistrationMode};
+    use crate::managed_config::client_proof;
+    use crate::protocol::control_message::{
+        RegRequestMsg, RegistrationMode, SubscriptionConfigAck, SubscriptionConfigApplyStatus,
+        SubscriptionRegistration, SubscriptionServerProof,
+    };
     use crate::server::control_server::db::{
-        ClientType, DeviceIpType, Ikev2InputRoute, NetworkSource, NetworkType,
+        ClientType, DeviceIpType, Ikev2InputRoute, ManagedConfigRecord, NetworkSource, NetworkType,
     };
+    use base64::Engine;
+    use bytes::Bytes;
     use ipnet::Ipv4Net;
     use std::collections::{HashMap, HashSet};
     use std::net::Ipv4Addr;
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn applied_ack_runtime_metadata_is_explicitly_marked_by_its_hash() {
+        let mut legacy = SubscriptionConfigAck {
+            revision: 1,
+            status: SubscriptionConfigApplyStatus::SubscriptionConfigApplied,
+            error: String::new(),
+            overridden_fields: Vec::new(),
+            apply_mode: String::new(),
+            changed_fields: Vec::new(),
+            effective_device_name: String::new(),
+            effective_ip: Ipv4Addr::UNSPECIFIED,
+            effective_prefix_len: 0,
+            effective_output: Vec::new(),
+            allow_ikev2: false,
+            allow_wireguard: false,
+            allow_mapping: false,
+            effective_config_sha256: Vec::new(),
+        };
+        assert!(!has_effective_runtime_metadata(&legacy));
+
+        legacy.effective_device_name = "node".to_string();
+        legacy.effective_config_sha256 = vec![7; 32];
+        assert!(has_effective_runtime_metadata(&legacy));
+    }
+
+    #[test]
+    fn normal_clients_are_allowed_but_only_valid_subscription_credentials_enable_sync() {
+        let credential_key = vec![7_u8; 32];
+        let record = ManagedConfigRecord {
+            network_code: "net".into(),
+            device_id: "dev".into(),
+            revision: 1,
+            config_toml: String::new(),
+            credential_key: Some(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&credential_key),
+            ),
+            subscription: None,
+            updated_at: 0,
+            configured_device_name: "node".into(),
+            configured_ip: None,
+            fixed_ip: None,
+        };
+        let client_nonce = vec![9_u8; 32];
+        let registration = SubscriptionRegistration {
+            network_code: "net".into(),
+            device_id: "dev".into(),
+            client_proof: client_proof(&credential_key, &client_nonce),
+            client_nonce,
+            instance_id: vec![3; 32],
+            applied_revision: 0,
+        };
+        assert!(authenticate_managed_access(Some(&record), None).is_none());
+        assert!(authenticate_managed_access(Some(&record), Some(&registration)).is_some());
+        let mut wrong = registration.clone();
+        wrong.client_proof[0] ^= 1;
+        assert!(authenticate_managed_access(Some(&record), Some(&wrong)).is_none());
+        let mut wrong_instance = registration.clone();
+        wrong_instance.instance_id.pop();
+        assert!(authenticate_managed_access(Some(&record), Some(&wrong_instance)).is_none());
+
+        let mut draft = record;
+        draft.credential_key = None;
+        assert!(authenticate_managed_access(Some(&draft), None).is_none());
+        assert!(authenticate_managed_access(Some(&draft), Some(&registration)).is_none());
+    }
+
+    #[test]
+    fn subscription_identity_must_match_runtime_registration() {
+        let request = registration("runtime-net", "runtime-dev");
+        let subscription = SubscriptionRegistration {
+            network_code: "managed-net".into(),
+            device_id: "managed-dev".into(),
+            client_nonce: vec![1; 32],
+            client_proof: vec![2; 32],
+            instance_id: vec![3; 32],
+            applied_revision: 0,
+        };
+        assert!(validate_subscription_identity(&request, Some(&subscription)).is_err());
+
+        let mut matching = subscription;
+        matching.network_code = request.network_code.clone();
+        matching.device_id = request.device_id.clone();
+        assert_eq!(
+            validate_subscription_identity(&request, Some(&matching)).unwrap(),
+            Some(("runtime-net".into(), "runtime-dev".into()))
+        );
+    }
+
+    #[test]
+    fn managed_registration_rejects_only_revision_ahead_of_server() {
+        assert!(validate_registered_revision(6, 7).is_ok());
+        assert!(validate_registered_revision(7, 7).is_ok());
+        assert!(validate_registered_revision(8, 7).is_err());
+    }
+
+    #[tokio::test]
+    async fn managed_push_waits_only_for_registration_response_queueing() {
+        let mut custom_nets = HashMap::new();
+        custom_nets.insert(
+            "managed-phase-net".to_string(),
+            "10.73.0.0/24".parse().unwrap(),
+        );
+        let service = ControlService::new(
+            "10.26.0.0/24".parse().unwrap(),
+            custom_nets,
+            HashSet::from(["managed-phase-net".to_string()]),
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+        let (sender, mut receiver) = mpsc::channel(4);
+        let identity = (
+            "managed-phase-net".to_string(),
+            "managed-device".to_string(),
+        );
+        service.subscription_sessions.insert(
+            identity.clone(),
+            SubscriptionSessionEntry {
+                instance_id: vec![3; 32],
+                client_instance_id: vec![6; 32],
+                runtime_network_code: identity.0.clone(),
+                ip: "10.73.0.2".parse().unwrap(),
+                applied_revision: 1,
+                apply_error: None,
+                overridden_fields: Vec::new(),
+                links: HashMap::from([(
+                    42,
+                    SubscriptionSessionLink {
+                        sender,
+                        server_proof: SubscriptionServerProof {
+                            server_nonce: vec![4; 32],
+                            server_proof: vec![5; 32],
+                            target_revision: 1,
+                        },
+                        registration_complete: false,
+                    },
+                )]),
+            },
+        );
+        let record = ManagedConfigRecord {
+            network_code: identity.0.clone(),
+            device_id: identity.1.clone(),
+            revision: 2,
+            config_toml: String::new(),
+            credential_key: None,
+            subscription: None,
+            updated_at: 0,
+            configured_device_name: "managed-device".into(),
+            configured_ip: Some("10.73.0.2".parse().unwrap()),
+            fixed_ip: None,
+        };
+
+        assert_eq!(
+            service.push_subscription_config(&record).await.unwrap(),
+            SubscriptionPushStatus::Registering
+        );
+        assert!(receiver.try_recv().is_err());
+
+        // This is exactly what the handler does after RegResponse has entered
+        // the same reliable queue. No startup/application ACK is involved.
+        service
+            .subscription_sessions
+            .get_mut(&identity)
+            .unwrap()
+            .links
+            .get_mut(&42)
+            .unwrap()
+            .registration_complete = true;
+        assert_eq!(
+            service.push_subscription_config(&record).await.unwrap(),
+            SubscriptionPushStatus::Queued
+        );
+        assert!(receiver.recv().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn direct_subscription_push_reports_queue_backpressure_and_closed_channel() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        assert_eq!(
+            ControlService::enqueue_subscription_payload(
+                &sender,
+                Bytes::from_static(b"first"),
+                Duration::from_millis(10),
+            )
+            .await,
+            SubscriptionPushStatus::Queued
+        );
+        assert_eq!(receiver.recv().await, Some(Bytes::from_static(b"first")));
+
+        sender.send(Bytes::from_static(b"occupied")).await.unwrap();
+        assert_eq!(
+            ControlService::enqueue_subscription_payload(
+                &sender,
+                Bytes::from_static(b"blocked"),
+                Duration::from_millis(1),
+            )
+            .await,
+            SubscriptionPushStatus::Timeout
+        );
+        assert_eq!(receiver.recv().await, Some(Bytes::from_static(b"occupied")));
+
+        drop(receiver);
+        assert_eq!(
+            ControlService::enqueue_subscription_payload(
+                &sender,
+                Bytes::from_static(b"closed"),
+                Duration::from_millis(10),
+            )
+            .await,
+            SubscriptionPushStatus::Closed
+        );
+    }
 
     fn registration(network_code: &str, device_id: &str) -> RegRequestMsg {
         RegRequestMsg {
@@ -1901,7 +2889,218 @@ mod tests {
             advertised_subnets: Vec::new(),
             allow_ikev2: false,
             allow_wireguard: false,
+            subscription: None,
+            client_instance_id: vec![1; 32],
         }
+    }
+
+    async fn multi_link_test_service(network_code: &str, net: Ipv4Net) -> ControlService {
+        ControlService::new(
+            "10.26.0.0/24".parse().unwrap(),
+            HashMap::from([(network_code.to_string(), net)]),
+            HashSet::from([network_code.to_string()]),
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn fixed_registration(
+        network_code: &str,
+        device_id: &str,
+        ip: Ipv4Addr,
+        client_instance_id: u8,
+    ) -> RegRequestMsg {
+        let mut request = registration(network_code, device_id);
+        request.ip = Some(ip);
+        request.ip_variable = false;
+        request.client_instance_id = vec![client_instance_id; 32];
+        request
+    }
+
+    #[tokio::test]
+    async fn same_client_instance_keeps_multiple_links_until_the_last_disconnects() {
+        let network_code = "multi-link-same-instance";
+        let service = multi_link_test_service(network_code, "10.80.0.0/24".parse().unwrap()).await;
+        let ip = "10.80.0.9".parse::<Ipv4Addr>().unwrap();
+        let (sender_a, mut receiver_a) = mpsc::channel(8);
+        let (sender_b, mut receiver_b) = mpsc::channel(8);
+        let session_a = service
+            .register(
+                fixed_registration(network_code, "device-a", ip, 7),
+                sender_a,
+            )
+            .await
+            .unwrap();
+        let session_b = service
+            .register(
+                fixed_registration(network_code, "device-a", ip, 7),
+                sender_b,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(session_a.ip, ip);
+        assert_eq!(session_b.ip, ip);
+        assert_eq!(session_a.network_state.count(), (1, 1));
+        let sender_pool = session_a
+            .network_state
+            .sender_map()
+            .get(&ip)
+            .unwrap()
+            .clone();
+        sender_pool
+            .try_send(Bytes::from_static(b"one-delivery"))
+            .unwrap();
+        let delivered =
+            usize::from(receiver_a.try_recv().is_ok()) + usize::from(receiver_b.try_recv().is_ok());
+        assert_eq!(delivered, 1, "one packet must use exactly one link");
+
+        while receiver_a.try_recv().is_ok() {}
+        while receiver_b.try_recv().is_ok() {}
+        drop(session_a);
+        assert!(session_b.network_state.is_device_online("device-a"));
+        assert!(session_b.network_state.sender_map().contains_key(&ip));
+        session_b
+            .network_state
+            .sender_map()
+            .get(&ip)
+            .unwrap()
+            .try_send(Bytes::from_static(b"remaining-link"))
+            .unwrap();
+        assert_eq!(
+            receiver_b.recv().await,
+            Some(Bytes::from_static(b"remaining-link"))
+        );
+
+        drop(session_b);
+        assert!(
+            sender_pool
+                .try_send(Bytes::from_static(b"offline"))
+                .is_err()
+        );
+        assert!(
+            !service
+                .get_network_state_provider()
+                .get_network_state(network_code)
+                .unwrap()
+                .is_device_online("device-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn new_client_instance_replaces_all_links_without_stale_drop_going_offline() {
+        let network_code = "multi-link-new-instance";
+        let service = multi_link_test_service(network_code, "10.81.0.0/24".parse().unwrap()).await;
+        let ip = "10.81.0.9".parse::<Ipv4Addr>().unwrap();
+        let (old_sender, mut old_receiver) = mpsc::channel(8);
+        let (new_sender, mut new_receiver) = mpsc::channel(8);
+        let old_session = service
+            .register(
+                fixed_registration(network_code, "device-a", ip, 8),
+                old_sender,
+            )
+            .await
+            .unwrap();
+        let new_session = service
+            .register(
+                fixed_registration(network_code, "device-a", ip, 9),
+                new_sender,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            old_session.network_state.active_link_ip(
+                old_session.ip,
+                &old_session.client_instance_id,
+                old_session.random_id,
+            ),
+            None
+        );
+        assert_eq!(
+            new_session.network_state.active_link_ip(
+                new_session.ip,
+                &new_session.client_instance_id,
+                new_session.random_id,
+            ),
+            Some(ip)
+        );
+
+        new_session
+            .network_state
+            .sender_map()
+            .get(&ip)
+            .unwrap()
+            .try_send(Bytes::from_static(b"new-instance"))
+            .unwrap();
+        assert!(old_receiver.try_recv().is_err());
+        assert_eq!(
+            new_receiver.recv().await,
+            Some(Bytes::from_static(b"new-instance"))
+        );
+
+        drop(old_session);
+        assert!(new_session.network_state.is_device_online("device-a"));
+        assert!(new_session.network_state.sender_map().contains_key(&ip));
+        drop(new_session);
+        assert!(
+            !service
+                .get_network_state_provider()
+                .get_network_state(network_code)
+                .unwrap()
+                .is_device_online("device-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_registration_is_idempotent_across_links_of_one_instance() {
+        let network_code = "multi-link-fast-reg";
+        let service = multi_link_test_service(network_code, "10.82.0.0/24".parse().unwrap()).await;
+        let old_ip = "10.82.0.9".parse::<Ipv4Addr>().unwrap();
+        let new_ip = "10.82.0.10".parse::<Ipv4Addr>().unwrap();
+        let (sender_a, _receiver_a) = mpsc::channel(8);
+        let (sender_b, _receiver_b) = mpsc::channel(8);
+        let mut session_a = service
+            .register(
+                fixed_registration(network_code, "device-a", old_ip, 10),
+                sender_a,
+            )
+            .await
+            .unwrap();
+        let mut session_b = service
+            .register(
+                fixed_registration(network_code, "device-a", old_ip, 10),
+                sender_b,
+            )
+            .await
+            .unwrap();
+
+        service.fast_register(&mut session_a, new_ip).await.unwrap();
+        assert_eq!(
+            session_b.network_state.active_link_ip(
+                session_b.ip,
+                &session_b.client_instance_id,
+                session_b.random_id,
+            ),
+            Some(new_ip)
+        );
+        service.fast_register(&mut session_b, new_ip).await.unwrap();
+        assert_eq!(session_a.ip, new_ip);
+        assert_eq!(session_b.ip, new_ip);
+        assert!(!session_a.network_state.sender_map().contains_key(&old_ip));
+        assert!(session_a.network_state.sender_map().contains_key(&new_ip));
+
+        drop(session_a);
+        assert!(session_b.network_state.is_device_online("device-a"));
+        drop(session_b);
+        assert!(
+            !service
+                .get_network_state_provider()
+                .get_network_state(network_code)
+                .unwrap()
+                .is_device_online("device-a")
+        );
     }
 
     #[test]
@@ -2079,7 +3278,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_ip_waits_for_valid_fast_registration_before_switching_session() {
+    async fn non_fixed_fast_registration_converges_secondary_server_state() {
         let service = ControlService::new(
             "10.26.0.0/24".parse().unwrap(),
             HashMap::new(),
@@ -2106,14 +3305,17 @@ mod tests {
         let old_ip = session.ip;
         let new_ip = "10.60.0.9".parse::<Ipv4Addr>().unwrap();
 
+        // This simulates a secondary VNTS that has not yet observed the
+        // primary management endpoint's IP edit. Its Static device table still
+        // contains the old address when the client sends FastReg.
         service
-            .update_device("public", "device-a", new_ip, DeviceIpType::Static)
+            .update_device("public", "device-a", old_ip, DeviceIpType::Static)
             .await
             .unwrap();
         assert_eq!(session.ip, old_ip);
         assert_eq!(
             session.network_state.configured_ip("device-a"),
-            Some(new_ip)
+            Some(old_ip)
         );
         let device_info = session
             .network_state
@@ -2121,7 +3323,7 @@ mod tests {
             .into_iter()
             .find(|device| device.device_id == "device-a")
             .unwrap();
-        assert_eq!(device_info.ip, Some(new_ip));
+        assert_eq!(device_info.ip, Some(old_ip));
         assert_eq!(device_info.current_ip, Some(old_ip));
         assert!(session.network_state.sender_map().contains_key(&old_ip));
         assert!(!session.network_state.sender_map().contains_key(&new_ip));
@@ -2133,13 +3335,6 @@ mod tests {
             "the active old IP must remain reserved"
         );
 
-        assert!(
-            service
-                .fast_register(&mut session, "10.60.0.8".parse().unwrap())
-                .await
-                .is_err()
-        );
-        assert_eq!(session.ip, old_ip);
         service.fast_register(&mut session, new_ip).await.unwrap();
         assert_eq!(session.ip, new_ip);
         let device_info = session
@@ -2149,8 +3344,23 @@ mod tests {
             .find(|device| device.device_id == "device-a")
             .unwrap();
         assert_eq!(device_info.current_ip, Some(new_ip));
+        assert_eq!(device_info.ip, Some(new_ip));
         assert!(!session.network_state.sender_map().contains_key(&old_ip));
         assert!(session.network_state.sender_map().contains_key(&new_ip));
+
+        // Fixed IP remains the exception: the server must not let a client
+        // replace an explicitly configured fixed address.
+        service
+            .update_device("public", "device-a", new_ip, DeviceIpType::Fixed)
+            .await
+            .unwrap();
+        assert!(
+            service
+                .fast_register(&mut session, "10.60.0.10".parse().unwrap())
+                .await
+                .is_err()
+        );
+        assert_eq!(session.ip, new_ip);
     }
 
     #[tokio::test]

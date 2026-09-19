@@ -5,6 +5,7 @@ defineProps<{
   open: boolean
   title?: string
   wide?: boolean
+  extraWide?: boolean
 }>()
 
 const emit = defineEmits<{ close: [] }>()
@@ -17,7 +18,7 @@ const emit = defineEmits<{ close: [] }>()
         <div class="absolute inset-0 bg-slate-900/40" @click="emit('close')"></div>
         <div
           class="relative max-h-[90vh] w-full overflow-y-auto rounded-2xl bg-white shadow-2xl dark:bg-slate-800"
-          :class="wide ? 'max-w-2xl' : 'max-w-md'"
+          :class="extraWide ? 'max-w-6xl' : wide ? 'max-w-2xl' : 'max-w-md'"
         >
           <div v-if="title" class="flex items-center justify-between border-b border-slate-100 px-6 py-4 dark:border-slate-700">
             <h3 class="text-base font-bold text-slate-900 dark:text-slate-100">{{ title }}</h3>

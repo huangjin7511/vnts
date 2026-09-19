@@ -15,6 +15,11 @@ import type {
   DeviceWireGuardAccessInfo,
   WireGuardServiceInfo,
   UpdateWireGuardServicePayload,
+  ClientAccessSettings,
+  ManagedConfig,
+  ManagedConfigMutation,
+  CreateManagedDevicePayload,
+  DeviceIpType,
 } from '@/types'
 
 export const authApi = {
@@ -68,6 +73,21 @@ export const deviceApi = {
     ),
 }
 
+export const managedDeviceApi = {
+  create: (payload: CreateManagedDevicePayload) =>
+    request<ManagedConfigMutation>('/devices', { method: 'POST', body: { ...payload, client_type: 'VNT' } }),
+  get: (code: string, deviceId: string) =>
+    request<ManagedConfig>(`/networks/${encodeURIComponent(code)}/devices/${encodeURIComponent(deviceId)}/client-config`),
+  update: (code: string, deviceId: string, configToml: string, currentServer: string, otherServers: string[], certMode: 'standard' | 'finger', deviceName: string, ip: string, ipType: DeviceIpType) =>
+    request<ManagedConfigMutation>(`/networks/${encodeURIComponent(code)}/devices/${encodeURIComponent(deviceId)}/client-config`, {
+      method: 'PUT', body: { config_toml: configToml, current_server: currentServer, other_servers: otherServers, cert_mode: certMode, device_name: deviceName, ip, ip_type: ipType },
+    }),
+  subscription: (code: string, deviceId: string) =>
+    request<{ subscription: string }>(`/networks/${encodeURIComponent(code)}/devices/${encodeURIComponent(deviceId)}/subscription`),
+  disconnect: (code: string, deviceId: string) =>
+    request<boolean>(`/networks/${encodeURIComponent(code)}/devices/${encodeURIComponent(deviceId)}/disconnect`, { method: 'POST' }),
+}
+
 export const peerServerApi = {
   list: () => request<PeerServersResponse>('/peer_servers'),
   add: (serverAddr: string) =>
@@ -77,6 +97,9 @@ export const peerServerApi = {
 }
 
 export const settingsApi = {
+  getClientAccess: () => request<ClientAccessSettings>('/settings/client-access'),
+  updateClientAccess: (payload: ClientAccessSettings) =>
+    request<ClientAccessSettings>('/settings/client-access', { method: 'PUT', body: payload }),
   getNetworkWhitelist: () =>
     request<NetworkWhitelistSettings>('/settings/network-whitelist'),
   updateNetworkWhitelist: (payload: NetworkWhitelistSettings) =>

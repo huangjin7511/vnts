@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod http;
+mod managed_config;
 mod protocol;
 mod server;
 mod utils;
@@ -77,10 +78,16 @@ async fn main() -> anyhow::Result<()> {
         cert: conf.cert.clone(),
         key: conf.key.clone(),
     };
+    let client_listener_ports = (
+        conf.tcp_bind.map(|addr| addr.port()),
+        conf.quic_bind.map(|addr| addr.port()),
+        conf.ws_bind.map(|addr| addr.port()),
+    );
 
     let web_bind = conf.web_bind;
     let ikev2_config = conf.ikev2.clone();
     let wireguard_config = conf.wireguard.clone();
+    let client_access = conf.client_access.clone();
     let username = conf.username.unwrap_or("admin".to_string());
     let password = conf.password.unwrap_or("admin".to_string());
 
@@ -92,7 +99,8 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    server::turn_server_start(turn_config, control_service.clone()).await?;
+    let certificate_fingerprint =
+        server::turn_server_start(turn_config, control_service.clone()).await?;
 
     if need_peer_manager {
         init_peer_manager(&peer_conf, &control_service).await;
@@ -115,6 +123,9 @@ async fn main() -> anyhow::Result<()> {
             password,
             web_bind,
             config_path,
+            client_access,
+            certificate_fingerprint,
+            client_listener_ports,
         )
         .await?;
         return Ok(());

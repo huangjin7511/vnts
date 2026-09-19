@@ -104,8 +104,6 @@ pub enum MsgType {
     RpcReq = 14,
     RpcRes = 15,
 
-    UpdateIp = 16,
-
     Quic = 17,
 
     FastReg = 22,
@@ -113,6 +111,8 @@ pub enum MsgType {
     SubnetSyncRes = 24,
     Ikev2Relay = 25,
     WireGuardRelay = 26,
+    SubscriptionConfigPush = 31,
+    SubscriptionConfigAck = 32,
 }
 
 impl From<MsgType> for u8 {
@@ -146,8 +146,6 @@ impl TryFrom<u8> for MsgType {
             14 => MsgType::RpcReq,
             15 => MsgType::RpcRes,
 
-            16 => MsgType::UpdateIp,
-
             17 => MsgType::Quic,
 
             22 => MsgType::FastReg,
@@ -155,6 +153,8 @@ impl TryFrom<u8> for MsgType {
             24 => MsgType::SubnetSyncRes,
             25 => MsgType::Ikev2Relay,
             26 => MsgType::WireGuardRelay,
+            31 => MsgType::SubscriptionConfigPush,
+            32 => MsgType::SubscriptionConfigAck,
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,

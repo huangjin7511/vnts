@@ -157,6 +157,26 @@ pub struct DeviceRecord {
     pub rx_bytes: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedConfigRecord {
+    pub network_code: String,
+    pub device_id: String,
+    pub revision: i64,
+    pub config_toml: String,
+    #[serde(skip_serializing)]
+    pub credential_key: Option<String>,
+    #[serde(skip_serializing)]
+    pub subscription: Option<String>,
+    pub updated_at: i64,
+    /// Authoritative device-table values used to rebuild protected TOML fields.
+    #[serde(skip)]
+    pub configured_device_name: String,
+    #[serde(skip)]
+    pub configured_ip: Option<Ipv4Addr>,
+    #[serde(skip)]
+    pub fixed_ip: Option<Ipv4Addr>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ikev2InputRoute {
     pub subnet: Ipv4Net,
@@ -169,6 +189,54 @@ fn decode_json_column<T: DeserializeOwned>(
 ) -> Result<T, sqlx::Error> {
     let value: String = row.try_get(column)?;
     serde_json::from_str(&value).map_err(|error| sqlx::Error::Decode(Box::new(error)))
+}
+
+/// SQLite has no `ADD COLUMN IF NOT EXISTS`.  Treat only the expected
+/// duplicate-column result as success so an old managed-config table is
+/// upgraded before any query starts selecting the new state columns.
+async fn add_column_if_missing(
+    pool: &SqlitePool,
+    statement: &str,
+    column: &str,
+) -> anyhow::Result<()> {
+    if let Err(error) = sqlx::query(statement).execute(pool).await
+        && !error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("duplicate column name")
+    {
+        return Err(error)
+            .with_context(|| format!("Failed to migrate vnt_device_configs column '{column}'"));
+    }
+    Ok(())
+}
+
+async fn migrate_managed_config_schema(pool: &SqlitePool) -> anyhow::Result<()> {
+    // `CREATE TABLE IF NOT EXISTS` does not upgrade installations created by
+    // earlier managed-configuration releases.  These columns are all read by
+    // `get_managed_config`, so migrate them before exposing the HTTP editor.
+    // Sync-state columns (applied_revision, apply_status, apply_error,
+    // overridden_fields) deliberately stay behind on old databases: that state
+    // now lives in the live subscription session, and unused leftover columns
+    // are harmless.
+    add_column_if_missing(
+        pool,
+        "ALTER TABLE vnt_device_configs ADD COLUMN credential_key TEXT",
+        "credential_key",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "ALTER TABLE vnt_device_configs ADD COLUMN subscription TEXT",
+        "subscription",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "ALTER TABLE vnt_device_configs ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
+        "updated_at",
+    )
+    .await
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -285,6 +353,14 @@ pub async fn init_db_pool() -> anyhow::Result<()> {
     .context("Failed to enforce unique device IPs; check existing duplicate IP records")?;
 
     sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_network_device_unique
+         ON devices(network_code, device_id)",
+    )
+    .execute(&pool)
+    .await
+    .context("Failed to enforce unique network/device identities")?;
+
+    sqlx::query(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_ikev2_username_unique
          ON devices(device_id) WHERE client_type = 1",
     )
@@ -311,6 +387,26 @@ pub async fn init_db_pool() -> anyhow::Result<()> {
     .execute(&pool)
     .await
     .context("Failed to create peer_servers table")?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS vnt_device_configs (
+            network_code TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            config_toml TEXT NOT NULL,
+            credential_key TEXT,
+            subscription TEXT,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(network_code, device_id),
+            FOREIGN KEY(network_code, device_id)
+                REFERENCES devices(network_code, device_id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await
+    .context("Failed to create vnt_device_configs table")?;
+
+    migrate_managed_config_schema(&pool).await?;
 
     let _ = DB_POOL.set(pool);
     Ok(())
@@ -550,18 +646,39 @@ pub async fn save_or_update_device(device: &DeviceRecord) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// 回收 IP：清空字段但保留记录
+/// 回收普通动态设备的 IP：清空字段但保留记录。
+///
+/// 受管 VNT 的目标地址属于 revisioned subscription envelope，客户端在注册前
+/// 就必须取得它；因此不能在离线租约清理时抹掉该设备表值。
 pub async fn release_device_ip(network_code: &str, device_id: &str) -> anyhow::Result<()> {
     let Some(pool) = DB_POOL.get() else {
         return Ok(());
     };
+    release_device_ip_on(pool, network_code, device_id).await
+}
 
-    sqlx::query(r#"UPDATE devices SET ip = NULL WHERE network_code = ? AND device_id = ?"#)
-        .bind(network_code)
-        .bind(device_id)
-        .execute(pool)
-        .await
-        .context("Failed to release device IP")?;
+/// Pool-parameterized core of [`release_device_ip`] so tests can exercise the
+/// query against a local pool without initializing the process-global one.
+async fn release_device_ip_on(
+    pool: &SqlitePool,
+    network_code: &str,
+    device_id: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"UPDATE devices
+           SET ip = NULL
+           WHERE network_code = ? AND device_id = ?
+             AND NOT EXISTS (
+                 SELECT 1 FROM vnt_device_configs
+                 WHERE vnt_device_configs.network_code = devices.network_code
+                   AND vnt_device_configs.device_id = devices.device_id
+             )"#,
+    )
+    .bind(network_code)
+    .bind(device_id)
+    .execute(pool)
+    .await
+    .context("Failed to release device IP")?;
 
     Ok(())
 }
@@ -731,6 +848,12 @@ pub async fn delete_device(network_code: &str, device_id: &str) -> anyhow::Resul
         return Ok(false);
     };
 
+    sqlx::query(r#"DELETE FROM vnt_device_configs WHERE network_code = ? AND device_id = ?"#)
+        .bind(network_code)
+        .bind(device_id)
+        .execute(pool)
+        .await
+        .context("Failed to delete managed device config")?;
     let result = sqlx::query(r#"DELETE FROM devices WHERE network_code = ? AND device_id = ?"#)
         .bind(network_code)
         .bind(device_id)
@@ -747,6 +870,11 @@ pub async fn delete_devices_by_network(network_code: &str) -> anyhow::Result<u64
         return Ok(0);
     };
 
+    sqlx::query(r#"DELETE FROM vnt_device_configs WHERE network_code = ?"#)
+        .bind(network_code)
+        .execute(pool)
+        .await
+        .context("Failed to delete managed configs by network")?;
     let result = sqlx::query(r#"DELETE FROM devices WHERE network_code = ?"#)
         .bind(network_code)
         .execute(pool)
@@ -754,6 +882,181 @@ pub async fn delete_devices_by_network(network_code: &str) -> anyhow::Result<u64
         .context("Failed to delete devices by network")?;
 
     Ok(result.rows_affected())
+}
+
+fn managed_record_from_row(row: SqliteRow) -> Result<ManagedConfigRecord, sqlx::Error> {
+    Ok(ManagedConfigRecord {
+        network_code: row.try_get("network_code")?,
+        device_id: row.try_get("device_id")?,
+        revision: row.try_get("revision")?,
+        config_toml: row.try_get("config_toml")?,
+        credential_key: row.try_get("credential_key")?,
+        subscription: row.try_get("subscription")?,
+        updated_at: row.try_get("updated_at")?,
+        configured_device_name: row.try_get("configured_device_name")?,
+        configured_ip: row
+            .try_get::<Option<String>, _>("configured_ip")?
+            .map(|value| value.parse())
+            .transpose()
+            .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
+        fixed_ip: row
+            .try_get::<Option<String>, _>("fixed_ip")?
+            .map(|value| value.parse())
+            .transpose()
+            .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
+    })
+}
+
+pub async fn get_managed_config(
+    network_code: &str,
+    device_id: &str,
+) -> anyhow::Result<Option<ManagedConfigRecord>> {
+    let Some(pool) = DB_POOL.get() else {
+        return Ok(None);
+    };
+    let row = sqlx::query(
+        "SELECT c.network_code, c.device_id, c.revision, c.config_toml, c.credential_key, c.subscription,
+                c.updated_at, d.device_name AS configured_device_name, d.ip AS configured_ip,
+                CASE WHEN d.ip_type = 2 THEN d.ip ELSE NULL END AS fixed_ip
+         FROM vnt_device_configs c
+         JOIN devices d ON d.network_code = c.network_code AND d.device_id = c.device_id
+         WHERE c.network_code = ? AND c.device_id = ?",
+    )
+    .bind(network_code)
+    .bind(device_id)
+    .fetch_optional(pool)
+    .await
+    .context("Failed to fetch managed config")?;
+    row.map(managed_record_from_row)
+        .transpose()
+        .map_err(Into::into)
+}
+
+pub async fn list_managed_configs() -> anyhow::Result<Vec<ManagedConfigRecord>> {
+    let Some(pool) = DB_POOL.get() else {
+        return Ok(Vec::new());
+    };
+    let rows = sqlx::query(
+        "SELECT c.network_code, c.device_id, c.revision, c.config_toml, c.credential_key, c.subscription,
+                c.updated_at, d.device_name AS configured_device_name, d.ip AS configured_ip,
+                CASE WHEN d.ip_type = 2 THEN d.ip ELSE NULL END AS fixed_ip
+         FROM vnt_device_configs c
+         JOIN devices d ON d.network_code = c.network_code AND d.device_id = c.device_id",
+    )
+    .fetch_all(pool)
+    .await
+    .context("Failed to list managed configs")?;
+    rows.into_iter()
+        .map(managed_record_from_row)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+pub async fn create_managed_config(record: &ManagedConfigRecord) -> anyhow::Result<()> {
+    let pool = DB_POOL
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("订阅链接配置需要启用 persistence"))?;
+    sqlx::query(
+        "INSERT INTO vnt_device_configs
+         (network_code, device_id, revision, config_toml, credential_key, subscription,
+          updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&record.network_code)
+    .bind(&record.device_id)
+    .bind(record.revision)
+    .bind(&record.config_toml)
+    .bind(&record.credential_key)
+    .bind(&record.subscription)
+    .bind(record.updated_at)
+    .execute(pool)
+    .await
+    .context("Failed to create managed config")?;
+    Ok(())
+}
+
+pub async fn update_managed_config(
+    network_code: &str,
+    device_id: &str,
+    config_toml: &str,
+    updated_at: i64,
+) -> anyhow::Result<Option<ManagedConfigRecord>> {
+    let Some(pool) = DB_POOL.get() else {
+        return Ok(None);
+    };
+    let result = sqlx::query(
+        "UPDATE vnt_device_configs
+         SET config_toml = ?, revision = revision + 1, updated_at = ?
+         WHERE network_code = ? AND device_id = ?",
+    )
+    .bind(config_toml)
+    .bind(updated_at)
+    .bind(network_code)
+    .bind(device_id)
+    .execute(pool)
+    .await
+    .context("Failed to update managed config")?;
+    if result.rows_affected() == 0 {
+        return Ok(None);
+    }
+    get_managed_config(network_code, device_id).await
+}
+
+/// Rewrites the persisted representation without changing its semantic revision.
+///
+/// This is used when legacy or user supplied TOML only differs by comments,
+/// formatting, or fields that are never part of the managed payload.
+pub async fn rewrite_managed_config(
+    network_code: &str,
+    device_id: &str,
+    config_toml: &str,
+    updated_at: i64,
+) -> anyhow::Result<Option<ManagedConfigRecord>> {
+    let Some(pool) = DB_POOL.get() else {
+        return Ok(None);
+    };
+    let result = sqlx::query(
+        "UPDATE vnt_device_configs
+         SET config_toml = ?, updated_at = ?
+         WHERE network_code = ? AND device_id = ?",
+    )
+    .bind(config_toml)
+    .bind(updated_at)
+    .bind(network_code)
+    .bind(device_id)
+    .execute(pool)
+    .await
+    .context("Failed to rewrite managed config")?;
+    if result.rows_affected() == 0 {
+        return Ok(None);
+    }
+    get_managed_config(network_code, device_id).await
+}
+
+pub async fn rotate_subscription_credentials(
+    network_code: &str,
+    device_id: &str,
+    credential_key: &str,
+    subscription: &str,
+    updated_at: i64,
+) -> anyhow::Result<bool> {
+    let Some(pool) = DB_POOL.get() else {
+        return Ok(false);
+    };
+    let result = sqlx::query(
+        "UPDATE vnt_device_configs
+         SET credential_key = ?, subscription = ?, updated_at = ?
+         WHERE network_code = ? AND device_id = ?",
+    )
+    .bind(credential_key)
+    .bind(subscription)
+    .bind(updated_at)
+    .bind(network_code)
+    .bind(device_id)
+    .execute(pool)
+    .await
+    .context("Failed to rotate managed token")?;
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn save_peer_server_if_not_exists(record: &PeerServerRecord) -> anyhow::Result<bool> {
@@ -830,4 +1133,120 @@ pub async fn delete_peer_server(server_addr: &str) -> anyhow::Result<bool> {
         .context("Failed to delete peer server")?;
 
     Ok(result.rows_affected() > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::migrate_managed_config_schema;
+    use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
+
+    #[tokio::test]
+    async fn release_device_ip_keeps_managed_device_address() {
+        let pool: SqlitePool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE devices (
+                network_code TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                ip TEXT,
+                PRIMARY KEY(network_code, device_id)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE vnt_device_configs (
+                network_code TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                config_toml TEXT NOT NULL,
+                PRIMARY KEY(network_code, device_id)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for (device_id, ip) in [("dynamic", "10.0.0.2"), ("managed", "10.0.0.3")] {            sqlx::query("INSERT INTO devices (network_code, device_id, ip) VALUES ('net', ?, ?)")
+                .bind(device_id)
+                .bind(ip)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO vnt_device_configs (network_code, device_id, revision, config_toml)
+             VALUES ('net', 'managed', 1, '')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        super::release_device_ip_on(&pool, "net", "dynamic").await.unwrap();
+        super::release_device_ip_on(&pool, "net", "managed").await.unwrap();
+
+        let dynamic_ip: Option<String> = sqlx::query(
+            "SELECT ip FROM devices WHERE network_code = 'net' AND device_id = 'dynamic'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("ip");
+        let managed_ip: Option<String> = sqlx::query(
+            "SELECT ip FROM devices WHERE network_code = 'net' AND device_id = 'managed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("ip");
+
+        assert!(dynamic_ip.is_none());
+        assert_eq!(managed_ip.as_deref(), Some("10.0.0.3"));
+    }
+
+    #[tokio::test]
+    async fn legacy_managed_config_schema_is_upgraded_before_reads() {
+        let pool: SqlitePool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE vnt_device_configs (
+                network_code TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                config_toml TEXT NOT NULL,
+                PRIMARY KEY(network_code, device_id)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO vnt_device_configs (network_code, device_id, revision, config_toml)
+             VALUES ('net', 'device', 1, '')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        migrate_managed_config_schema(&pool).await.unwrap();
+        migrate_managed_config_schema(&pool).await.unwrap();
+
+        let row = sqlx::query(
+            "SELECT credential_key, subscription, updated_at
+             FROM vnt_device_configs WHERE network_code = 'net' AND device_id = 'device'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<i64, _>("updated_at"), 0);
+        assert!(row.get::<Option<String>, _>("credential_key").is_none());
+        assert!(row.get::<Option<String>, _>("subscription").is_none());
+    }
 }

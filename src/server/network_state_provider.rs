@@ -13,6 +13,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -38,6 +39,121 @@ impl DirectionTraffic {
 pub struct TrafficStats {
     tx: Mutex<DirectionTraffic>,
     rx: Mutex<DirectionTraffic>,
+}
+
+#[derive(Clone)]
+pub struct DeviceSender {
+    inner: Arc<Mutex<DeviceSenderInner>>,
+}
+
+struct DeviceSenderInner {
+    client_instance_id: Vec<u8>,
+    links: HashMap<u64, DeviceLink>,
+}
+
+struct DeviceLink {
+    sender: Sender<Bytes>,
+    latency_ms: Option<u32>,
+}
+
+impl DeviceSender {
+    fn new(client_instance_id: Vec<u8>, random_id: u64, sender: Sender<Bytes>) -> Self {
+        let mut links = HashMap::new();
+        links.insert(
+            random_id,
+            DeviceLink {
+                sender,
+                latency_ms: None,
+            },
+        );
+        Self {
+            inner: Arc::new(Mutex::new(DeviceSenderInner {
+                client_instance_id,
+                links,
+            })),
+        }
+    }
+
+    fn same_instance(&self, client_instance_id: &[u8]) -> bool {
+        !client_instance_id.is_empty()
+            && self.inner.lock().client_instance_id.as_slice() == client_instance_id
+    }
+
+    fn owns_link(&self, client_instance_id: &[u8], random_id: u64) -> bool {
+        let inner = self.inner.lock();
+        inner.client_instance_id.as_slice() == client_instance_id
+            && inner.links.contains_key(&random_id)
+    }
+
+    fn add_link(&self, random_id: u64, sender: Sender<Bytes>) {
+        self.inner.lock().links.insert(
+            random_id,
+            DeviceLink {
+                sender,
+                latency_ms: None,
+            },
+        );
+    }
+
+    fn remove_link(&self, client_instance_id: &[u8], random_id: u64) -> Option<bool> {
+        let mut inner = self.inner.lock();
+        if inner.client_instance_id.as_slice() != client_instance_id
+            || inner.links.remove(&random_id).is_none()
+        {
+            return None;
+        }
+        Some(inner.links.is_empty())
+    }
+
+    fn update_latency(&self, random_id: u64, latency_ms: u32) -> bool {
+        let mut inner = self.inner.lock();
+        let Some(link) = inner.links.get_mut(&random_id) else {
+            return false;
+        };
+        link.latency_ms = Some(latency_ms);
+        true
+    }
+
+    fn best_latency(&self) -> Option<u32> {
+        self.inner
+            .lock()
+            .links
+            .values()
+            .filter_map(|link| link.latency_ms)
+            .min()
+    }
+
+    fn links_empty(&self) -> bool {
+        self.inner.lock().links.is_empty()
+    }
+
+    pub fn try_send(&self, payload: Bytes) -> Result<(), TrySendError<Bytes>> {
+        let mut links = self
+            .inner
+            .lock()
+            .links
+            .values()
+            .map(|link| (link.latency_ms.unwrap_or(u32::MAX), link.sender.clone()))
+            .collect::<Vec<_>>();
+        links.sort_by_key(|(latency, _)| *latency);
+        let mut last_error = None;
+        for (_, sender) in links {
+            match sender.try_send(payload.clone()) {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or(TrySendError::Closed(payload)))
+    }
+
+    pub fn try_send_all(&self, payload: Bytes) -> usize {
+        self.inner
+            .lock()
+            .links
+            .values()
+            .filter(|link| link.sender.try_send(payload.clone()).is_ok())
+            .count()
+    }
 }
 
 impl TrafficStats {
@@ -94,6 +210,9 @@ pub struct DeviceEntry {
     pub allow_ikev2: bool,
     pub allow_wireguard: bool,
     pub random_id: u64,
+    /// Last name reported by a running VNT client. The configured name remains
+    /// in `device_name` and is never overwritten by registration or ACK data.
+    pub runtime_device_name: Option<String>,
     pub device_name: String,
     pub device_version: String,
     pub is_connected: bool,
@@ -154,6 +273,7 @@ impl DeviceEntry {
             allow_ikev2: false,
             allow_wireguard: false,
             random_id: 0,
+            runtime_device_name: None,
             device_name: record.device_name,
             device_version: record.device_version,
             is_connected: false,
@@ -219,7 +339,7 @@ pub struct NetworkState {
     gateway: Ipv4Addr,
     net: Ipv4Net,
     lease_duration: Duration,
-    sender_map: DashMap<Ipv4Addr, Sender<Bytes>>,
+    sender_map: DashMap<Ipv4Addr, DeviceSender>,
     lease_state: Mutex<NetworkStateInner>,
     traffic_stats_map: DashMap<Ipv4Addr, Arc<TrafficStats>>,
 }
@@ -245,8 +365,28 @@ impl NetworkState {
         self.net.contains(&ip)
     }
 
-    pub fn sender_map(&self) -> &DashMap<Ipv4Addr, Sender<Bytes>> {
+    pub fn sender_map(&self) -> &DashMap<Ipv4Addr, DeviceSender> {
         &self.sender_map
+    }
+
+    pub fn active_link_ip(
+        &self,
+        expected_ip: Ipv4Addr,
+        client_instance_id: &[u8],
+        random_id: u64,
+    ) -> Option<Ipv4Addr> {
+        if self
+            .sender_map
+            .get(&expected_ip)
+            .is_some_and(|sender| sender.owns_link(client_instance_id, random_id))
+        {
+            return Some(expected_ip);
+        }
+        self.sender_map.iter().find_map(|sender| {
+            sender
+                .owns_link(client_instance_id, random_id)
+                .then_some(*sender.key())
+        })
     }
 
     pub fn first_available_ip_excluding(
@@ -289,16 +429,60 @@ impl NetworkState {
         device_id: &String,
         ip: Ipv4Addr,
         random_id: u64,
+        client_instance_id: &[u8],
+    ) -> Option<DeviceRecord> {
+        let sender = self.sender_map.get(&ip)?.clone();
+        match sender.remove_link(client_instance_id, random_id) {
+            None => return None,
+            Some(false) => {
+                if let Some(latency) = sender.best_latency() {
+                    let mut guard = self.lease_state.lock();
+                    if let Some(entry) = guard.device_map.get_mut(device_id) {
+                        entry.latency_ms = Some(latency);
+                    }
+                }
+                return None;
+            }
+            Some(true) => {}
+        }
+        self.finalize_offline(device_id, ip, sender)
+    }
+
+    /// remove_link 在 lease_state 锁外执行，期间新实例注册可能已替换 sender_map[ip]，
+    /// 或同实例会话经快速路径向同一 pool 追加新链接；此时必须放弃本次离线标记，
+    /// 否则会把仍在线的新会话误标为离线并清掉其转发映射与流量统计。
+    fn finalize_offline(
+        &self,
+        device_id: &String,
+        ip: Ipv4Addr,
+        sender: DeviceSender,
     ) -> Option<DeviceRecord> {
         let mut guard = self.lease_state.lock();
-        let (success, record) = guard.offline_ip(&self.network_code, device_id, ip, random_id);
+        let pool_drained = self
+            .sender_map
+            .get(&ip)
+            .is_some_and(|current| Arc::ptr_eq(&current.inner, &sender.inner))
+            && sender.links_empty();
+        if !pool_drained {
+            log::info!(
+                "skip offline, session superseded network_code={},device_id={device_id},ip={ip}",
+                self.network_code,
+            );
+            return None;
+        }
+        let (success, record) = guard.offline_ip(&self.network_code, device_id, ip, None);
         if success {
             log::info!(
                 "offline_ip network_code={},device_id={device_id},ip={ip}",
                 self.network_code,
             );
-            self.sender_map.remove(&ip);
-            self.traffic_stats_map.remove(&ip);
+            if self
+                .sender_map
+                .remove_if(&ip, |_, current| Arc::ptr_eq(&current.inner, &sender.inner))
+                .is_some()
+            {
+                self.traffic_stats_map.remove(&ip);
+            }
 
             record
         } else {
@@ -348,12 +532,28 @@ impl NetworkState {
         None
     }
 
-    /// 释放预注册但未确认的 IP，通过 random_id 避免误删其他会话
-    pub fn release_pre_registered_ip(&self, device_id: &String, ip: Ipv4Addr, random_id: u64) {
+    /// 释放预注册但未确认的 IP，通过 random_id 避免误删其他会话。
+    /// 会话断开与其余链接的注册可能并发：必须先把该会话的链接从 pool 中移除，
+    /// 且 pool 已排空才允许释放，否则会删掉仍在线链接的注册信息。
+    pub fn release_pre_registered_ip(
+        &self,
+        device_id: &String,
+        ip: Ipv4Addr,
+        random_id: u64,
+        client_instance_id: &[u8],
+    ) {
         let should_remove = {
             let mut guard = self.lease_state.lock();
+            let pool_drained = self
+                .sender_map
+                .get(&ip)
+                .map(|pool| pool.remove_link(client_instance_id, random_id) == Some(true))
+                .unwrap_or(true);
             if let Some(device_entry) = guard.device_map.get(device_id) {
-                if device_entry.random_id == random_id && device_entry.ip == Some(ip) {
+                if pool_drained
+                    && device_entry.random_id == random_id
+                    && device_entry.ip == Some(ip)
+                {
                     guard.device_map.remove(device_id);
                     guard.device_ip_map.remove(&ip);
                     guard.active_ip_map.remove(&ip);
@@ -382,6 +582,38 @@ impl NetworkState {
     pub fn get_device_entry(&self, device_id: &str) -> Option<DeviceEntry> {
         let guard = self.lease_state.lock();
         guard.device_map.get(device_id).cloned()
+    }
+
+    /// Applies runtime metadata reported by the authenticated managed session.
+    /// Session identity and IP remain authoritative; the acknowledgement is
+    /// never allowed to retarget another device.
+    pub fn update_managed_runtime_metadata(
+        &self,
+        device_id: &str,
+        device_name: &str,
+        advertised_subnets: Vec<Ipv4Net>,
+        allow_ikev2: bool,
+        allow_wireguard: bool,
+    ) -> Option<DeviceRecord> {
+        let mut guard = self.lease_state.lock();
+        let valid = guard
+            .device_map
+            .get(device_id)
+            .is_some_and(|entry| entry.is_connected && entry.client_type == ClientType::Vnt);
+        if !valid {
+            return None;
+        }
+        guard.data_version += 1;
+        let data_version = guard.data_version;
+        let entry = guard.device_map.get_mut(device_id)?;
+        if !device_name.is_empty() {
+            entry.runtime_device_name = Some(device_name.to_string());
+        }
+        entry.advertised_subnets = advertised_subnets;
+        entry.allow_ikev2 = allow_ikev2;
+        entry.allow_wireguard = allow_wireguard;
+        entry.data_version = data_version;
+        Some(entry.to_record(&self.network_code))
     }
 
     pub fn get_device_entry_by_ip(&self, ip: Ipv4Addr) -> Option<DeviceEntry> {
@@ -518,6 +750,7 @@ impl NetworkState {
                     allow_ikev2: false,
                     allow_wireguard: false,
                     random_id: 0,
+                    runtime_device_name: None,
                     device_name,
                     device_version: String::new(),
                     is_connected: false,
@@ -564,23 +797,47 @@ impl NetworkState {
         guard.full_sync_version = guard.data_version;
     }
 
+    pub fn restore_device_record(&self, record: DeviceRecord) {
+        let device_id = record.device_id.clone();
+        self.restore_device_config(&device_id, Some(DeviceEntry::from_record(record)));
+    }
+
     pub fn fast_register(
         &self,
         device_id: &str,
         old_ip: Ipv4Addr,
         new_ip: Ipv4Addr,
         random_id: u64,
+        client_instance_id: &[u8],
     ) -> anyhow::Result<()> {
         let mut guard = self.lease_state.lock();
         let entry = guard
             .device_map
             .get(device_id)
             .ok_or_else(|| anyhow::anyhow!("设备不存在"))?;
-        if entry.random_id != random_id || !entry.is_connected {
+        if !entry.is_connected {
             bail!("会话已失效");
         }
-        if entry.ip != Some(new_ip) {
-            bail!("快速注册 IP 与设备最新 IP 不一致");
+        if let Some(pool) = self.sender_map.get(&new_ip)
+            && pool.owns_link(client_instance_id, random_id)
+        {
+            return Ok(());
+        }
+        // A managed client can switch a Dynamic or Static address after
+        // receiving a configuration revision from another VNTS endpoint. In
+        // that multi-server case this endpoint has no need to have observed
+        // the management write first: the authenticated, live session is the
+        // authority for its active address. Fixed addresses remain server
+        // enforced and therefore cannot be changed by FastReg.
+        if entry.ip_type == DeviceIpType::Fixed && entry.ip != Some(new_ip) {
+            bail!("快速注册 IP 与设备设置的固定 IP 不一致");
+        }
+        if !self.net.contains(&new_ip)
+            || new_ip == self.gateway
+            || new_ip == self.net.network()
+            || new_ip == self.net.broadcast()
+        {
+            bail!("快速注册 IP 不在可用虚拟网段内");
         }
         guard.validate_ip_available(new_ip, Some(device_id))?;
         if guard.active_ip_map.get(&old_ip).map(String::as_str) != Some(device_id) {
@@ -590,6 +847,7 @@ impl NetworkState {
         let sender = self
             .sender_map
             .get(&old_ip)
+            .filter(|value| value.owns_link(client_instance_id, random_id))
             .map(|value| value.clone())
             .ok_or_else(|| anyhow::anyhow!("当前会话发送通道不存在"))?;
         let stats = self
@@ -604,7 +862,15 @@ impl NetworkState {
         if old_ip != new_ip {
             guard.full_sync_version = data_version;
         }
+        let configured_ip = guard.device_map.get(device_id).and_then(|entry| entry.ip);
+        if configured_ip != Some(new_ip) {
+            if let Some(configured_ip) = configured_ip {
+                guard.device_ip_map.remove(&configured_ip);
+            }
+            guard.device_ip_map.insert(new_ip, device_id.to_string());
+        }
         if let Some(entry) = guard.device_map.get_mut(device_id) {
+            entry.ip = Some(new_ip);
             entry.data_version = data_version;
         }
         self.sender_map.remove(&old_ip);
@@ -683,8 +949,19 @@ impl NetworkState {
         random_id: u64,
         sender: Sender<Bytes>,
         client_type: ClientType,
+        client_instance_id: Vec<u8>,
     ) -> anyhow::Result<(Ipv4Addr, Option<Ipv4Addr>, Option<DeviceEntry>)> {
         let mut guard = self.lease_state.lock();
+        if !client_instance_id.is_empty()
+            && let Some(existing) = guard.device_map.get(&reg_req.device_id).cloned()
+            && let Some(ip) = existing.ip
+            && reg_req.ip == Some(ip)
+            && let Some(pool) = self.sender_map.get(&ip)
+            && pool.same_instance(&client_instance_id)
+        {
+            pool.add_link(random_id, sender);
+            return Ok((ip, None, Some(existing)));
+        }
         let (ip, old_ip) = guard.allocate_ip_as(
             &self.net,
             self.gateway,
@@ -716,7 +993,8 @@ impl NetworkState {
         }
 
         let entry = guard.device_map.get(&reg_req.device_id).cloned();
-        self.sender_map.insert(ip, sender);
+        self.sender_map
+            .insert(ip, DeviceSender::new(client_instance_id, random_id, sender));
         guard.active_ip_map.insert(ip, reg_req.device_id.clone());
 
         if let Some(entry) = &entry {
@@ -734,7 +1012,7 @@ impl NetworkState {
         random_id: u64,
         sender: Sender<Bytes>,
     ) -> anyhow::Result<(Ipv4Addr, Option<Ipv4Addr>, Option<DeviceEntry>)> {
-        self.allocate_ip_and_get_entry_as(reg_req, random_id, sender, ClientType::Vnt)
+        self.allocate_ip_and_get_entry_as(reg_req, random_id, sender, ClientType::Vnt, Vec::new())
     }
 
     pub fn collect_expired_devices(&self) -> Vec<String> {
@@ -773,6 +1051,13 @@ impl NetworkState {
             list.push(crate::server::control_server::service::DeviceInfoVO {
                 device_id: entry.device_id.clone(),
                 device_name: entry.device_name.clone(),
+                current_device_name: entry.is_connected.then(|| {
+                    entry
+                        .runtime_device_name
+                        .as_deref()
+                        .unwrap_or(&entry.device_name)
+                        .to_string()
+                }),
                 device_version: entry.device_version.clone(),
                 ip: entry.ip,
                 current_ip: active_ips.get(entry.device_id.as_str()).copied(),
@@ -814,6 +1099,13 @@ impl NetworkState {
                 tx_bytes: entry.traffic_stats.get_tx(),
                 rx_bytes: entry.traffic_stats.get_rx(),
                 client_type: entry.client_type,
+                managed: false,
+                subscription_session: false,
+                subscription_issued: false,
+                subscription_target_revision: None,
+                subscription_applied_revision: None,
+                subscription_status: None,
+                subscription_error: None,
             });
         }
         list
@@ -953,7 +1245,11 @@ impl NetworkState {
             }
             let last_connect_time: OffsetDateTime = entry.last_connect_time.into();
             list.push(ClientInfo {
-                name: entry.device_name.clone(),
+                name: entry
+                    .runtime_device_name
+                    .as_ref()
+                    .unwrap_or(&entry.device_name)
+                    .clone(),
                 version: entry.device_version.clone(),
                 ip: ip.into(),
                 key_sign: entry.key_sign.clone(),
@@ -979,13 +1275,13 @@ impl NetworkStateInner {
         network_code: &str,
         device_id: &String,
         ip: Ipv4Addr,
-        random_id: u64,
+        random_id: Option<u64>,
     ) -> (bool, Option<DeviceRecord>) {
         let Some(device_entry) = self.device_map.get_mut(device_id) else {
             log::error!("unknown device_id {}", device_id);
             return (false, None);
         };
-        if device_entry.random_id != random_id {
+        if random_id.is_some_and(|random_id| device_entry.random_id != random_id) {
             return (false, None);
         }
         let removes_different_ip = device_entry.ip != Some(ip);
@@ -1137,7 +1433,11 @@ impl NetworkStateInner {
             device_entry.client_type = client_type;
             device_entry.allow_ikev2 = reg_req.allow_ikev2;
             device_entry.allow_wireguard = reg_req.allow_wireguard;
-            device_entry.device_name = reg_req.name.clone();
+            if client_type == ClientType::Vnt {
+                device_entry.runtime_device_name = Some(reg_req.name.clone());
+            } else {
+                device_entry.device_name = reg_req.name.clone();
+            }
             device_entry.device_version = reg_req.version.clone();
             device_entry.advertised_subnets = advertised_subnets.clone();
             device_entry.subnet_advertisement_active = subnet_advertisement_active;
@@ -1194,7 +1494,11 @@ impl NetworkStateInner {
                 let entry = if let Some(mut entry) = existing_entry.clone() {
                     entry.ip = Some(ip);
                     entry.random_id = random_id;
-                    entry.device_name = reg_req.name;
+                    if client_type == ClientType::Vnt {
+                        entry.runtime_device_name = Some(reg_req.name);
+                    } else {
+                        entry.device_name = reg_req.name;
+                    }
                     entry.device_version = reg_req.version;
                     entry.is_connected = true;
                     entry.last_connect_time = SystemTime::now();
@@ -1220,6 +1524,8 @@ impl NetworkStateInner {
                         allow_ikev2: reg_req.allow_ikev2,
                         allow_wireguard: reg_req.allow_wireguard,
                         random_id,
+                        runtime_device_name: (client_type == ClientType::Vnt)
+                            .then(|| reg_req.name.clone()),
                         device_name: reg_req.name,
                         device_version: reg_req.version,
                         is_connected: true,
@@ -1252,7 +1558,11 @@ impl NetworkStateInner {
             }
             entry.ip = Some(ip);
             entry.random_id = random_id;
-            entry.device_name = reg_req.name;
+            if client_type == ClientType::Vnt {
+                entry.runtime_device_name = Some(reg_req.name);
+            } else {
+                entry.device_name = reg_req.name;
+            }
             entry.device_version = reg_req.version;
             entry.is_connected = true;
             entry.last_connect_time = SystemTime::now();
@@ -1278,6 +1588,7 @@ impl NetworkStateInner {
                 allow_ikev2: reg_req.allow_ikev2,
                 allow_wireguard: reg_req.allow_wireguard,
                 random_id,
+                runtime_device_name: (client_type == ClientType::Vnt).then(|| reg_req.name.clone()),
                 device_name: reg_req.name,
                 device_version: reg_req.version,
                 is_connected: true,
@@ -1413,7 +1724,14 @@ impl NetworkState {
         *self.time.lock() = Instant::now();
     }
 
-    pub fn update_client_latency(&self, ip: Ipv4Addr, latency_ms: u32) {
+    pub fn update_client_latency(&self, ip: Ipv4Addr, random_id: u64, latency_ms: u32) {
+        let Some(sender) = self.sender_map.get(&ip).map(|sender| sender.clone()) else {
+            return;
+        };
+        if !sender.update_latency(random_id, latency_ms) {
+            return;
+        }
+        let latency_ms = sender.best_latency().unwrap_or(latency_ms);
         let mut guard = self.lease_state.lock();
         if let Some(device_id) = guard.device_ip_map.get(&ip).cloned()
             && let Some(entry) = guard.device_map.get_mut(&device_id)
@@ -1451,9 +1769,15 @@ impl NetworkStateProvider {
         self.network_states.get(network_code).map(|s| s.clone())
     }
 
-    pub fn update_client_latency(&self, network_code: &str, ip: Ipv4Addr, latency_ms: u32) {
+    pub fn update_client_latency(
+        &self,
+        network_code: &str,
+        ip: Ipv4Addr,
+        random_id: u64,
+        latency_ms: u32,
+    ) {
         if let Some(state) = self.get_network_state(network_code) {
-            state.update_client_latency(ip, latency_ms);
+            state.update_client_latency(ip, random_id, latency_ms);
         }
     }
 }
@@ -1468,13 +1792,41 @@ impl Deref for NetworkStateProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::NetworkStateInner;
+    use super::{DeviceSender, NetworkState, NetworkStateInner};
     use crate::protocol::control_message::{RegRequestMsg, RegistrationMode};
-    use crate::server::control_server::db::DeviceIpType;
+    use crate::server::control_server::db::{ClientType, DeviceIpType};
+    use bytes::Bytes;
     use ipnet::Ipv4Net;
+    use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::net::Ipv4Addr;
     use std::time::{Duration, SystemTime};
+    use tokio::sync::mpsc;
+    use tokio::time::Instant;
+
+    #[tokio::test]
+    async fn device_sender_falls_back_when_the_lowest_latency_link_is_closed() {
+        let (fallback_sender, mut fallback_receiver) = mpsc::channel(1);
+        let (preferred_sender, mut preferred_receiver) = mpsc::channel(1);
+        let sender = DeviceSender::new(vec![1; 32], 1, fallback_sender);
+        sender.add_link(2, preferred_sender);
+        assert!(sender.update_latency(1, 20));
+        assert!(sender.update_latency(2, 5));
+
+        sender.try_send(Bytes::from_static(b"preferred")).unwrap();
+        assert_eq!(
+            preferred_receiver.recv().await,
+            Some(Bytes::from_static(b"preferred"))
+        );
+        assert!(fallback_receiver.try_recv().is_err());
+        drop(preferred_receiver);
+
+        sender.try_send(Bytes::from_static(b"fallback")).unwrap();
+        assert_eq!(
+            fallback_receiver.recv().await,
+            Some(Bytes::from_static(b"fallback"))
+        );
+    }
 
     fn request(ip: Ipv4Addr, ip_variable: bool) -> RegRequestMsg {
         RegRequestMsg {
@@ -1490,6 +1842,8 @@ mod tests {
             advertised_subnets: Vec::new(),
             allow_ikev2: false,
             allow_wireguard: false,
+            subscription: None,
+            client_instance_id: Vec::new(),
         }
     }
 
@@ -1501,6 +1855,34 @@ mod tests {
             device_ip_map: HashMap::new(),
             active_ip_map: HashMap::new(),
         }
+    }
+
+    fn outer_state() -> NetworkState {
+        NetworkState {
+            time: Mutex::new(Instant::now()),
+            network_code: "test-net".to_string(),
+            gateway: Ipv4Addr::new(10, 26, 0, 1),
+            net: "10.26.0.0/24".parse().unwrap(),
+            lease_duration: Duration::from_secs(60),
+            sender_map: Default::default(),
+            lease_state: Mutex::new(empty_state()),
+            traffic_stats_map: Default::default(),
+        }
+    }
+
+    async fn register(
+        state: &NetworkState,
+        ip: Ipv4Addr,
+        instance: u8,
+        random_id: u64,
+    ) -> tokio::sync::mpsc::Receiver<Bytes> {
+        let (tx, rx) = mpsc::channel(1);
+        let mut req = request(ip, false);
+        req.client_instance_id = vec![instance; 32];
+        state
+            .allocate_ip_and_get_entry_as(req, random_id, tx, ClientType::Vnt, vec![instance; 32])
+            .unwrap();
+        rx
     }
 
     #[test]
@@ -1550,7 +1932,7 @@ mod tests {
             vec!["172.16.0.0/16".parse().unwrap()]
         );
 
-        let (removed, _) = state.offline_ip("test-net", &format!("device-{ip}"), ip, 1);
+        let (removed, _) = state.offline_ip("test-net", &format!("device-{ip}"), ip, Some(1));
         assert!(!removed);
         assert!(
             state
@@ -1559,6 +1941,86 @@ mod tests {
                 .unwrap()
                 .is_connected
         );
+    }
+
+    // 复现旧会话断开与新实例注册的竞态：remove_link 成功后、拿到 lease_state
+    // 锁之前，新实例已完成注册并替换 sender_map[ip]，此时不得标记离线。
+    #[tokio::test]
+    async fn superseded_session_cannot_mark_newer_session_offline() {
+        let state = outer_state();
+        let ip = Ipv4Addr::new(10, 26, 0, 2);
+        let device_id = format!("device-{ip}");
+
+        let _rx = register(&state, ip, 1, 11).await;
+        let stale_pool = state.sender_map.get(&ip).unwrap().clone();
+        let _rx_new = register(&state, ip, 2, 22).await;
+
+        assert_eq!(stale_pool.remove_link(&[1; 32], 11), Some(true));
+        assert!(state.finalize_offline(&device_id, ip, stale_pool).is_none());
+
+        assert!(state.is_device_online(&device_id));
+        let guard = state.lease_state.lock();
+        assert_eq!(guard.active_ip_map.get(&ip), Some(&device_id));
+        drop(guard);
+        assert!(state.sender_map.get(&ip).unwrap().same_instance(&[2; 32]));
+        assert!(state.traffic_stats_map.get(&ip).is_some());
+    }
+
+    // 同实例最后一个链接断开后、收尾加锁前，快速路径又注册了新链接：
+    // pool 未排空，不得标记离线，新链接必须保留。
+    #[tokio::test]
+    async fn link_added_during_disconnect_window_keeps_device_online() {
+        let state = outer_state();
+        let ip = Ipv4Addr::new(10, 26, 0, 2);
+        let device_id = format!("device-{ip}");
+
+        let _rx = register(&state, ip, 1, 11).await;
+        let pool = state.sender_map.get(&ip).unwrap().clone();
+        assert_eq!(pool.remove_link(&[1; 32], 11), Some(true));
+        let _rx_new = register(&state, ip, 1, 33).await;
+
+        assert!(state.finalize_offline(&device_id, ip, pool).is_none());
+        assert!(state.is_device_online(&device_id));
+        assert!(state.sender_map.get(&ip).unwrap().owns_link(&[1; 32], 33));
+    }
+
+    #[tokio::test]
+    async fn last_link_offline_still_tears_down_session() {
+        let state = outer_state();
+        let ip = Ipv4Addr::new(10, 26, 0, 2);
+        let device_id = format!("device-{ip}");
+
+        let _rx = register(&state, ip, 1, 11).await;
+        state.record_tx_traffic(ip, 100);
+
+        let record = state.offline_ip(&device_id, ip, 11, &[1; 32]);
+        assert!(record.is_some());
+        assert!(!state.is_device_online(&device_id));
+        assert!(state.sender_map.get(&ip).is_none());
+        assert!(state.traffic_stats_map.get(&ip).is_none());
+        let guard = state.lease_state.lock();
+        assert!(!guard.active_ip_map.contains_key(&ip));
+    }
+
+    #[test]
+    fn managed_registration_updates_runtime_name_without_overwriting_configured_name() {
+        let net = "10.26.0.0/24".parse::<Ipv4Net>().unwrap();
+        let gateway = Ipv4Addr::new(10, 26, 0, 1);
+        let ip = Ipv4Addr::new(10, 26, 0, 2);
+        let device_id = format!("device-{ip}");
+        let mut state = empty_state();
+        state
+            .allocate_ip(&net, gateway, request(ip, false), 1)
+            .unwrap();
+        state.device_map.get_mut(&device_id).unwrap().device_name = "configured".to_string();
+
+        let mut registration = request(ip, false);
+        registration.name = "runtime-name".to_string();
+        state.allocate_ip(&net, gateway, registration, 2).unwrap();
+
+        let entry = state.device_map.get(&device_id).unwrap();
+        assert_eq!(entry.device_name, "configured");
+        assert_eq!(entry.runtime_device_name.as_deref(), Some("runtime-name"));
     }
 
     #[test]

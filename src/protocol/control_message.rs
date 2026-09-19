@@ -10,11 +10,12 @@ use prost::Message;
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
+#[allow(clippy::enum_variant_names)]
 mod proto {
     include!(concat!(env!("OUT_DIR"), "/protocol.control_message.rs"));
 }
 
-pub use proto::{ClientType, RegistrationMode};
+pub use proto::{ClientType, RegistrationMode, SubscriptionConfigApplyStatus};
 
 #[derive(Debug, Clone)]
 pub struct RegRequestMsg {
@@ -30,6 +31,8 @@ pub struct RegRequestMsg {
     pub advertised_subnets: Vec<Ipv4Net>,
     pub allow_ikev2: bool,
     pub allow_wireguard: bool,
+    pub subscription: Option<SubscriptionRegistration>,
+    pub client_instance_id: Vec<u8>,
 }
 impl RegRequestMsg {
     pub const MAX_NETWORK_CODE_LEN: usize = 32;
@@ -74,6 +77,10 @@ impl RegRequestMsg {
             ));
         }
 
+        if !self.client_instance_id.is_empty() && self.client_instance_id.len() != 32 {
+            return Err(anyhow!("client_instance_id must contain 32 bytes"));
+        }
+
         Ok(())
     }
     pub fn from(msg: proto::RegRequestMsg) -> anyhow::Result<Self> {
@@ -98,6 +105,8 @@ impl RegRequestMsg {
             advertised_subnets,
             allow_ikev2: msg.allow_ikev2,
             allow_wireguard: msg.allow_wireguard,
+            subscription: msg.subscription.map(SubscriptionRegistration::from),
+            client_instance_id: msg.client_instance_id,
         })
     }
     pub fn to(self) -> proto::RegRequestMsg {
@@ -118,6 +127,8 @@ impl RegRequestMsg {
                 .collect(),
             allow_ikev2: self.allow_ikev2,
             allow_wireguard: self.allow_wireguard,
+            subscription: self.subscription.map(SubscriptionRegistration::to),
+            client_instance_id: self.client_instance_id,
         }
     }
 }
@@ -128,6 +139,10 @@ pub struct RegResponseMsg {
     pub gateway: Ipv4Addr,
     pub server_version: String,
     pub subnet_sync_supported: bool,
+    pub subscription_config_supported: bool,
+    pub subscription: Option<SubscriptionServerProof>,
+    pub server_instance_id: Vec<u8>,
+    pub multi_link_supported: bool,
 }
 impl RegResponseMsg {
     pub fn to(self) -> proto::RegResponseMsg {
@@ -137,7 +152,175 @@ impl RegResponseMsg {
             gateway: self.gateway.into(),
             server_version: self.server_version,
             subnet_sync_supported: self.subnet_sync_supported,
+            subscription_config_supported: self.subscription_config_supported,
+            subscription: self.subscription.map(SubscriptionServerProof::to),
+            server_instance_id: self.server_instance_id,
+            multi_link_supported: self.multi_link_supported,
         }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SubscriptionRegistration {
+    pub network_code: String,
+    pub device_id: String,
+    pub client_nonce: Vec<u8>,
+    pub client_proof: Vec<u8>,
+    pub instance_id: Vec<u8>,
+    pub applied_revision: u64,
+}
+
+impl SubscriptionRegistration {
+    fn from(value: proto::SubscriptionRegistration) -> Self {
+        Self {
+            network_code: value.network_code,
+            device_id: value.device_id,
+            client_nonce: value.client_nonce,
+            client_proof: value.client_proof,
+            instance_id: value.instance_id,
+            applied_revision: value.applied_revision,
+        }
+    }
+
+    fn to(self) -> proto::SubscriptionRegistration {
+        proto::SubscriptionRegistration {
+            network_code: self.network_code,
+            device_id: self.device_id,
+            client_nonce: self.client_nonce,
+            client_proof: self.client_proof,
+            instance_id: self.instance_id,
+            applied_revision: self.applied_revision,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SubscriptionServerProof {
+    pub server_nonce: Vec<u8>,
+    pub server_proof: Vec<u8>,
+    pub target_revision: u64,
+}
+
+impl SubscriptionServerProof {
+    fn to(self) -> proto::SubscriptionServerProof {
+        proto::SubscriptionServerProof {
+            server_nonce: self.server_nonce,
+            server_proof: self.server_proof,
+            target_revision: self.target_revision,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SubscriptionConfigFetchRequest {
+    pub network_code: String,
+    pub device_id: String,
+    pub client_nonce: Vec<u8>,
+    pub client_proof: Vec<u8>,
+    pub instance_id: Vec<u8>,
+    pub applied_revision: u64,
+}
+
+impl SubscriptionConfigFetchRequest {
+    fn from(msg: proto::SubscriptionConfigFetchRequest) -> Self {
+        Self {
+            network_code: msg.network_code,
+            device_id: msg.device_id,
+            client_nonce: msg.client_nonce,
+            client_proof: msg.client_proof,
+            instance_id: msg.instance_id,
+            applied_revision: msg.applied_revision,
+        }
+    }
+    fn to(self) -> proto::SubscriptionConfigFetchRequest {
+        proto::SubscriptionConfigFetchRequest {
+            network_code: self.network_code,
+            device_id: self.device_id,
+            client_nonce: self.client_nonce,
+            client_proof: self.client_proof,
+            instance_id: self.instance_id,
+            applied_revision: self.applied_revision,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SubscriptionConfigEnvelope {
+    pub revision: u64,
+    pub toml: String,
+    pub managed_ip: Ipv4Addr,
+    pub managed_prefix_len: u8,
+    pub managed_device_name: String,
+    pub server_proof: SubscriptionServerProof,
+    pub network_code: String,
+    pub device_id: String,
+    pub source_server_id: String,
+    pub content_sha256: Vec<u8>,
+}
+
+impl SubscriptionConfigEnvelope {
+    pub fn encode(self) -> BytesMut {
+        self.to().encode_bytes_mut()
+    }
+    fn to(self) -> proto::SubscriptionConfigEnvelope {
+        proto::SubscriptionConfigEnvelope {
+            revision: self.revision,
+            config: Some(proto::SubscriptionConfigV1 {
+                toml: self.toml,
+                managed_ip: u32::from(self.managed_ip),
+                managed_prefix_len: self.managed_prefix_len.into(),
+                managed_device_name: self.managed_device_name,
+            }),
+            server_proof: Some(self.server_proof.to()),
+            network_code: self.network_code,
+            device_id: self.device_id,
+            source_server_id: self.source_server_id,
+            content_sha256: self.content_sha256,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SubscriptionConfigAck {
+    pub revision: u64,
+    pub status: SubscriptionConfigApplyStatus,
+    pub error: String,
+    pub overridden_fields: Vec<String>,
+    pub apply_mode: String,
+    pub changed_fields: Vec<String>,
+    pub effective_device_name: String,
+    pub effective_ip: Ipv4Addr,
+    pub effective_prefix_len: u32,
+    pub effective_output: Vec<Ipv4Net>,
+    pub allow_ikev2: bool,
+    pub allow_wireguard: bool,
+    pub allow_mapping: bool,
+    pub effective_config_sha256: Vec<u8>,
+}
+
+impl SubscriptionConfigAck {
+    pub fn from_slice(buf: &[u8]) -> anyhow::Result<Self> {
+        let msg = proto::SubscriptionConfigAck::decode(buf)?;
+        Ok(Self {
+            revision: msg.revision,
+            status: msg.status(),
+            error: msg.error,
+            overridden_fields: msg.overridden_fields,
+            apply_mode: msg.apply_mode,
+            changed_fields: msg.changed_fields,
+            effective_device_name: msg.effective_device_name,
+            effective_ip: Ipv4Addr::from(msg.effective_ip),
+            effective_prefix_len: msg.effective_prefix_len,
+            effective_output: msg
+                .effective_output
+                .into_iter()
+                .map(ipv4_subnet_from_proto)
+                .collect::<anyhow::Result<_>>()?,
+            allow_ikev2: msg.allow_ikev2,
+            allow_wireguard: msg.allow_wireguard,
+            allow_mapping: msg.allow_mapping,
+            effective_config_sha256: msg.effective_config_sha256,
+        })
     }
 }
 
@@ -277,6 +460,7 @@ pub enum RequestMessage {
     Reg(RegRequestMsg),
     ConfirmReg(ConfirmRegMsg),
     FastReg(FastRegRequestMsg),
+    SubscriptionConfig(SubscriptionConfigFetchRequest),
 }
 impl RequestMessage {
     pub fn from_slice(buf: &[u8]) -> anyhow::Result<Self> {
@@ -292,6 +476,9 @@ impl RequestMessage {
             RequestPayload::FastReg(fast_reg) => {
                 Ok(RequestMessage::FastReg(FastRegRequestMsg::from(fast_reg)?))
             }
+            RequestPayload::SubscriptionConfig(request) => Ok(RequestMessage::SubscriptionConfig(
+                SubscriptionConfigFetchRequest::from(request),
+            )),
         }
     }
     pub fn encode(self) -> BytesMut {
@@ -299,6 +486,9 @@ impl RequestMessage {
             RequestMessage::Reg(reg) => RequestPayload::Reg(reg.to()),
             RequestMessage::ConfirmReg(confirm) => RequestPayload::ConfirmReg(confirm.to()),
             RequestMessage::FastReg(fast_reg) => RequestPayload::FastReg(fast_reg.to()),
+            RequestMessage::SubscriptionConfig(request) => {
+                RequestPayload::SubscriptionConfig(request.to())
+            }
         };
         proto::RequestMessage {
             request_payload: Some(request_payload),
@@ -312,6 +502,7 @@ pub enum ResponseMessage {
     Error(ErrorResponseMsg),
     ConfirmReg(ConfirmRegResponseMsg),
     FastReg(FastRegResponseMsg),
+    SubscriptionConfig(SubscriptionConfigEnvelope),
 }
 impl ResponseMessage {
     pub fn encode(self) -> BytesMut {
@@ -320,6 +511,9 @@ impl ResponseMessage {
             ResponseMessage::Error(e) => ResponsePayload::Error(e.to()),
             ResponseMessage::ConfirmReg(confirm) => ResponsePayload::ConfirmReg(confirm.to()),
             ResponseMessage::FastReg(fast_reg) => ResponsePayload::FastReg(fast_reg.to()),
+            ResponseMessage::SubscriptionConfig(config) => {
+                ResponsePayload::SubscriptionConfig(config.to())
+            }
         };
         proto::ResponseMessage {
             response_payload: Some(response_payload),

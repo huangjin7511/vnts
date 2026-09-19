@@ -31,16 +31,20 @@ pub struct TurnConfig {
 pub async fn turn_server_start(
     config: TurnConfig,
     control_service: ControlService,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     if config.tcp_bind.is_none() && config.quic_bind.is_none() && config.ws_bind.is_none() {
         bail!("An address must be bound")
     }
     let (certs, key) = crate::utils::cert::get_cert_and_key(config.cert, config.key)?;
+    let mut certificate_fingerprint = None;
     for cert in certs.iter() {
         let mut hasher = Sha256::new();
         hasher.update(cert.as_ref());
         let calculated_hash: [u8; 32] = hasher.finalize().into();
         log::info!("Fingerprint: {}", hex::encode(calculated_hash));
+        if certificate_fingerprint.is_none() {
+            certificate_fingerprint = Some(hex::encode(calculated_hash));
+        }
     }
     // TCP 和 WS 绑定同一地址时，使用混合监听自动检测协议
     if config.tcp_bind == config.ws_bind {
@@ -91,5 +95,5 @@ pub async fn turn_server_start(
         .await?;
     }
 
-    Ok(())
+    certificate_fingerprint.ok_or_else(|| anyhow::anyhow!("TLS certificate chain is empty"))
 }

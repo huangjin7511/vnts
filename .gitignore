@@ -12,6 +12,7 @@ static/
 config.toml
 cert.pem
 key.pem
+.*.managed-share-key
 ikev2-ca.pem
 ikev2-ca-key.pem
 ikev2-cert.pem

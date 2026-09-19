@@ -35,6 +35,7 @@ export type DeviceStatus = 'Online' | 'Remote' | string
 export interface DeviceInfo {
   device_id: string
   device_name: string
+  current_device_name: string | null
   device_version: string
   client_type: ClientType
   ip: string | null
@@ -55,6 +56,13 @@ export interface DeviceInfo {
   /** 前端基于两次轮询差分计算出的瞬时网速 */
   tx_speed?: number
   rx_speed?: number
+  managed: boolean
+  subscription_session: boolean
+  subscription_issued: boolean
+  subscription_target_revision: number | null
+  subscription_applied_revision: number | null
+  subscription_status: string | null
+  subscription_error: string | null
 }
 
 export interface CreateNetworkPayload {
@@ -178,4 +186,81 @@ export interface DeviceWireGuardAccessInfo {
 
 export interface NetworkWhitelistSettings {
   network_codes: string[]
+}
+
+export interface ClientAccessSettings {
+  server: string[]
+  cert_mode: string
+  listener_ports?: {
+    tcp: number | null
+    quic: number | null
+    wss: number | null
+  }
+}
+
+export interface ManagedConfig {
+  network_code: string
+  device_id: string
+  revision: number
+  config_toml: string
+  advanced_config_toml: string
+  applied_revision: number
+  status: string
+  error: string | null
+  overridden_fields: string[]
+  updated_at: number
+  subscription_issued: boolean
+  client_config: VntClientConfig
+}
+
+export interface VntClientConfig {
+  current_server: string
+  other_servers: string[]
+  cert_mode: 'standard' | 'finger'
+  password: string
+  peer_address: string[]
+  turn: string[]
+  punch_model: string[]
+  device_mode: '' | 'tun' | 'tap' | 'no'
+  mtu: number | null
+  tun_name: string
+  outbound_interface: string
+  input: string[]
+  output: string[]
+  port_mapping: string[]
+  subnet_mapping: string[]
+  udp_stun: string[]
+  tcp_stun: string[]
+  tunnel_addr: string[]
+  tunnel_port: number | null
+  ctrl_port: number | null
+  no_punch: boolean | null
+  no_broadcast: boolean | null
+  allow_ikev2: boolean | null
+  allow_wireguard: boolean | null
+  compress: boolean | null
+  rtx: boolean | null
+  fec: boolean | null
+  auto_sync_subnet: boolean | null
+  no_nat: boolean | null
+  allow_mapping: boolean | null
+}
+
+export interface ManagedConfigMutation {
+  config: ManagedConfig
+  push_status: 'queued' | 'not_connected' | 'registering' | 'timeout' | 'closed' | 'unchanged'
+  subscription?: string
+}
+
+export interface CreateManagedDevicePayload {
+  network_code: string
+  device_id: string
+  device_name: string
+  ip: string
+  ip_type: DeviceIpType
+  config_toml: string
+  current_server: string
+  other_servers: string[]
+  cert_mode: 'standard' | 'finger'
+  client_type?: 'VNT'
 }

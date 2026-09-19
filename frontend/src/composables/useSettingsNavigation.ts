@@ -1,6 +1,6 @@
 import { computed, reactive } from 'vue'
 
-export type SettingsSectionId = 'access-control' | 'ikev2' | 'wireguard'
+export type SettingsSectionId = 'access-control' | 'client-access' | 'ikev2' | 'wireguard'
 export type SettingsStatusTone = 'neutral' | 'success' | 'warning' | 'danger'
 
 export interface SettingsSectionState {
@@ -17,6 +17,7 @@ const defaultState = (): SettingsSectionState => ({
 
 const sectionStates = reactive<Record<SettingsSectionId, SettingsSectionState>>({
   'access-control': defaultState(),
+  'client-access': defaultState(),
   ikev2: defaultState(),
   wireguard: defaultState(),
 })

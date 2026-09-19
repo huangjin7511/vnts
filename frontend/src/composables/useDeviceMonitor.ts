@@ -171,7 +171,8 @@ export function useDeviceMonitor() {
         (d.current_ip && d.current_ip.includes(q)) ||
         d.advertised_subnets.some((subnet) => subnet.toLowerCase().includes(q)) ||
         d.device_id.toLowerCase().includes(q) ||
-        d.device_name.toLowerCase().includes(q),
+        d.device_name.toLowerCase().includes(q) ||
+        Boolean(d.current_device_name?.toLowerCase().includes(q)),
     )
 
     const groups = new Map<string, DeviceInfo[]>()
