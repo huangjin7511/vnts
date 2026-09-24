@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ChevronDown, Network, Radio, Server, Settings, ShieldCheck, Waves } from '@lucide/vue'
+import { ChevronDown, Link2, Network, Radio, Server, Settings, ShieldCheck, Waves } from '@lucide/vue'
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
 import AppLogo from './AppLogo.vue'
@@ -8,7 +8,11 @@ import { useSettingsNavigation } from '@/composables/useSettingsNavigation'
 const { sectionStates } = useSettingsNavigation()
 const route = useRoute()
 const settingsActive = computed(() => route.name === 'settings')
-const activeSettingsSection = computed(() => route.query.section === 'ikev2' || route.query.section === 'wireguard' ? route.query.section : 'access-control')
+const activeSettingsSection = computed(() =>
+  route.query.section === 'client-access' || route.query.section === 'ikev2' || route.query.section === 'wireguard'
+    ? route.query.section
+    : 'access-control',
+)
 </script>
 
 <template>
@@ -55,6 +59,15 @@ const activeSettingsSection = computed(() => route.query.section === 'ikev2' || 
               <ShieldCheck :size="15" class="shrink-0" />
               <span class="min-w-0 flex-1 truncate">访问控制</span>
               <span v-if="sectionStates['access-control'].dirty" class="h-2 w-2 shrink-0 rounded-full bg-amber-500" title="有未保存修改"></span>
+            </RouterLink>
+            <RouterLink
+              :to="{ name: 'settings', query: { section: 'client-access' } }"
+              class="settings-submenu-item"
+              :class="activeSettingsSection === 'client-access' ? 'settings-submenu-active' : ''"
+            >
+              <Link2 :size="15" class="shrink-0" />
+              <span class="min-w-0 flex-1 truncate">客户端接入</span>
+              <span v-if="sectionStates['client-access'].dirty" class="h-2 w-2 shrink-0 rounded-full bg-amber-500" title="有未保存修改"></span>
             </RouterLink>
             <RouterLink
               :to="{ name: 'settings', query: { section: 'ikev2' } }"

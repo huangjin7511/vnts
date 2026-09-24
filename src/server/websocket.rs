@@ -31,16 +31,13 @@ pub async fn listen(
 
     let tls_acceptor = TlsAcceptor::from(Arc::new(config));
 
-    let listener = TcpListener::bind(ws_config.addr)
-        .await
+    let listener = TcpListener::from_std(crate::utils::net::bind_tcp_listener(ws_config.addr)?)
         .context(format!("tcp bind error:{}", ws_config.addr))?;
 
     log::info!("WebSocket listening on: {} (TLS)", ws_config.addr,);
 
     tokio::spawn(async move {
-        if let Err(e) = ws_accept(tls_acceptor, listener, control_service).await {
-            log::error!("ws_accept:{e:?}")
-        }
+        ws_accept(tls_acceptor, listener, control_service).await;
     });
 
     Ok(())
@@ -50,9 +47,16 @@ async fn ws_accept(
     tls_acceptor: TlsAcceptor,
     listener: TcpListener,
     control_service: ControlService,
-) -> anyhow::Result<()> {
+) {
     loop {
-        let (stream, peer_addr) = listener.accept().await.context("tcp accept error")?;
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                log::error!("websocket tcp accept error: {error}");
+                tokio::time::sleep(crate::server::ACCEPT_ERROR_RETRY_DELAY).await;
+                continue;
+            }
+        };
         log::info!("accept websocket connection: {peer_addr}");
 
         let tls_acceptor = tls_acceptor.clone();

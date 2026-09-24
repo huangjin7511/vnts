@@ -4,20 +4,27 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::net::Ipv4Addr;
 use toml_edit::DocumentMut;
+use uuid::Uuid;
 
 use crate::utils::config::ClientAccessConfig;
 
-pub const SUBSCRIPTION_PREFIX: &str = "vnt2://join/1/";
-pub const MIN_MTU: u16 = 576;
+pub const SUBSCRIPTION_PREFIX: &str = "vnt2://join/2/";
+/// 下限对齐客户端 P2P 栈（rustp2p-core IpStack）的 IPv6 MTU 要求：
+/// 低于 1280 的配置能让客户端热应用，但会让后续实例创建失败
+pub const MIN_MTU: u16 = 1280;
 pub const MAX_MTU: u16 = 1500;
 
+/// 生成设备唯一的订阅接入 ID（UUID v4）。创建设备时赋值；编辑时若为空则补赋。
+pub fn new_join_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SubscriptionPayloadV1 {
+pub struct SubscriptionPayloadV2 {
     pub v: u8,
     pub server: String,
     pub cert_mode: String,
-    pub network_code: String,
-    pub device_id: String,
+    pub join_id: String,
     pub credential_key: String,
 }
 
@@ -295,25 +302,20 @@ impl ManagedClientConfigForm {
 pub fn issue_subscription(
     access: &ClientAccessConfig,
     certificate_fingerprint: Option<&str>,
-    network_code: &str,
-    device_id: &str,
+    join_id: &str,
 ) -> anyhow::Result<IssuedSubscription> {
     access.validate()?;
-    let cert_mode = resolve_cert_mode(access, certificate_fingerprint)?;
-    if cert_mode == "skip" {
-        anyhow::bail!("订阅链接接入禁止跳过证书校验");
-    }
+    let cert_mode = resolve_cert_mode(certificate_fingerprint)?;
 
     let mut random = [0_u8; 32];
     rand::rng().fill(&mut random);
     let credential_key = sha256(&random);
     let credential_key = URL_SAFE_NO_PAD.encode(credential_key);
-    let payload = SubscriptionPayloadV1 {
-        v: 1,
-        server: access.server.first().cloned().expect("validated server"),
+    let payload = SubscriptionPayloadV2 {
+        v: 2,
+        server: access.effective_subscription_server(),
         cert_mode,
-        network_code: network_code.to_string(),
-        device_id: device_id.to_string(),
+        join_id: join_id.to_string(),
         credential_key: credential_key.clone(),
     };
     let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload)?);
@@ -340,21 +342,11 @@ pub fn server_proof(credential_key: &[u8], client_nonce: &[u8], server_nonce: &[
     digest.finalize().to_vec()
 }
 
-pub fn resolve_cert_mode(
-    access: &ClientAccessConfig,
-    certificate_fingerprint: Option<&str>,
-) -> anyhow::Result<String> {
-    access.validate()?;
-    match access.cert_mode.as_str() {
-        "finger" => {
-            let fingerprint = certificate_fingerprint
-                .filter(|value| value.len() == 64)
-                .ok_or_else(|| anyhow::anyhow!("无法取得服务端证书 SHA-256 指纹"))?;
-            Ok(format!("finger:{}", fingerprint.to_ascii_lowercase()))
-        }
-        "skip" => anyhow::bail!("订阅链接接入禁止跳过证书校验"),
-        value => Ok(value.to_string()),
-    }
+pub fn resolve_cert_mode(certificate_fingerprint: Option<&str>) -> anyhow::Result<String> {
+    let fingerprint = certificate_fingerprint
+        .filter(|value| value.len() == 64)
+        .ok_or_else(|| anyhow::anyhow!("无法取得服务端证书 SHA-256 指纹"))?;
+    Ok(format!("finger:{}", fingerprint.to_ascii_lowercase()))
 }
 
 pub fn validate_managed_advanced_config(source: &str) -> anyhow::Result<()> {
@@ -567,7 +559,7 @@ pub fn canonicalize_client_config(
     // A server-side draft may exist before a public client endpoint is
     // configured. Issuing a subscription still calls `ClientAccessConfig::validate`
     // and therefore cannot publish an unusable draft.
-    if !access.server.is_empty() {
+    if !access.effective_subscription_server().is_empty() {
         access.validate()?;
     }
     if resolved_cert_mode == "skip" {
@@ -597,7 +589,7 @@ pub fn canonicalize_client_config(
         "server".to_string(),
         toml::Value::Array(
             access
-                .server
+                .resolved_traffic_servers()
                 .iter()
                 .cloned()
                 .map(toml::Value::String)
@@ -616,6 +608,7 @@ pub fn canonicalize_stored_client_config(
     source: &str,
     device_name: &str,
     is_fixed_ip: bool,
+    subscription_server: Option<&str>,
 ) -> anyhow::Result<String> {
     let mut table: toml::Table = if source.trim().is_empty() {
         Default::default()
@@ -661,11 +654,19 @@ pub fn canonicalize_stored_client_config(
         })
         .transpose()?
         .unwrap_or_else(|| "standard".to_string());
-    let access = ClientAccessConfig {
-        server: servers,
-        cert_mode,
+    // 订阅端点在记录里单独保存时，存储的 server 列表就是完整流量列表
+    // （create 写入的是 resolved_traffic_servers，可能包含订阅端点本身）；
+    // 只有缺失该字段的旧记录才按旧约定把首项当作订阅端点剥离。
+    let access = match subscription_server.filter(|value| !value.trim().is_empty()) {
+        Some(subscription_server) => {
+            ClientAccessConfig::new(subscription_server.to_string(), servers)
+        }
+        None => ClientAccessConfig::new(
+            servers.first().cloned().unwrap_or_default(),
+            servers.into_iter().skip(1).collect(),
+        ),
     };
-    if !access.server.is_empty() {
+    if !access.effective_subscription_server().is_empty() {
         access.validate()?;
     }
     let mut advanced = table.clone();
@@ -676,7 +677,7 @@ pub fn canonicalize_stored_client_config(
     canonicalize_client_config(
         &toml::to_string(&advanced)?,
         &access,
-        &access.cert_mode,
+        &cert_mode,
         device_name,
         is_fixed_ip,
     )
@@ -744,25 +745,25 @@ mod tests {
     use super::*;
 
     fn access() -> ClientAccessConfig {
-        ClientAccessConfig {
-            server: vec!["tcp://vpn.example.com:29872".to_string()],
-            cert_mode: "standard".to_string(),
-        }
+        ClientAccessConfig::new("tcp://vpn.example.com:29872".to_string(), Vec::new())
     }
 
     #[test]
     fn subscription_contains_only_bootstrap_material() {
-        let issued = issue_subscription(&access(), None, "net", "dev").unwrap();
+        let issued = issue_subscription(&access(), Some(&"a".repeat(64)), "join-id").unwrap();
         assert!(issued.subscription.starts_with(SUBSCRIPTION_PREFIX));
         let encoded = issued
             .subscription
             .strip_prefix(SUBSCRIPTION_PREFIX)
             .unwrap();
-        let payload: SubscriptionPayloadV1 =
+        let payload: SubscriptionPayloadV2 =
             serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded).unwrap()).unwrap();
-        assert_eq!(payload.v, 1);
+        assert_eq!(payload.v, 2);
+        assert_eq!(payload.join_id, "join-id");
         assert_eq!(payload.credential_key.len(), 43);
         assert!(!encoded.contains("password"));
+        assert!(!encoded.contains("network_code"));
+        assert!(!encoded.contains("device_id"));
         assert_eq!(
             URL_SAFE_NO_PAD
                 .decode(&issued.credential_key)
@@ -773,26 +774,23 @@ mod tests {
     }
 
     #[test]
-    fn multiple_servers_are_supported_for_all_ip_types() {
-        let access = ClientAccessConfig {
-            server: vec![
-                "tcp://vpn-a.example.com:29872".to_string(),
-                "quic://vpn-b.example.com:29872".to_string(),
-            ],
-            cert_mode: "standard".to_string(),
-        };
-        let issued = issue_subscription(&access, None, "net", "dev").unwrap();
+    fn subscription_and_traffic_servers_are_kept_separate() {
+        let access = ClientAccessConfig::new(
+            "tcp://vpn-a.example.com:29872".to_string(),
+            vec!["quic://vpn-b.example.com:29872".to_string()],
+        );
+        let issued = issue_subscription(&access, Some(&"a".repeat(64)), "join-id").unwrap();
         let encoded = issued
             .subscription
             .strip_prefix(SUBSCRIPTION_PREFIX)
             .unwrap();
-        let payload: SubscriptionPayloadV1 =
+        let payload: SubscriptionPayloadV2 =
             serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded).unwrap()).unwrap();
-        assert_eq!(payload.server, access.server[0]);
+        assert_eq!(payload.server, access.effective_subscription_server());
         let dynamic = canonicalize_client_config("", &access, "standard", "node", false).unwrap();
         let fixed = canonicalize_client_config("", &access, "standard", "node", true).unwrap();
         assert_eq!(dynamic, fixed);
-        assert!(dynamic.contains("vpn-a.example.com"));
+        assert!(!dynamic.contains("vpn-a.example.com"));
         assert!(dynamic.contains("vpn-b.example.com"));
     }
 
@@ -858,7 +856,7 @@ mod tests {
             validate_managed_advanced_config("tunnel_addr = ['0.0.0.0:1']\ntunnel_port = 1")
                 .is_err()
         );
-        assert!(validate_managed_advanced_config("mtu = 576").is_ok());
+        assert!(validate_managed_advanced_config("mtu = 1280").is_ok());
         assert!(validate_managed_advanced_config("mtu = 1500").is_ok());
         assert!(validate_managed_advanced_config("mtu = 575").is_err());
         assert!(validate_managed_advanced_config("mtu = 1501").is_err());
@@ -949,6 +947,8 @@ mod tests {
 
     #[test]
     fn invalid_historical_config_is_rejected_at_delivery_boundary() {
-        assert!(canonicalize_stored_client_config("compress = 'yes'", "node", false).is_err());
+        assert!(
+            canonicalize_stored_client_config("compress = 'yes'", "node", false, None).is_err()
+        );
     }
 }

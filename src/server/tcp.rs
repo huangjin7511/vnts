@@ -26,24 +26,24 @@ pub async fn listen(tcp_config: TcpConfig, control_service: ControlService) -> a
 
     let acceptor = TlsAcceptor::from(Arc::new(config));
 
-    let listener = TcpListener::bind(tcp_config.addr)
-        .await
+    let listener = TcpListener::from_std(crate::utils::net::bind_tcp_listener(tcp_config.addr)?)
         .context(format!("bind error:{}", tcp_config.addr))?;
     log::info!("TCP listening on: {} (TLS)", tcp_config.addr);
     tokio::spawn(async move {
-        if let Err(e) = tcp_accept(acceptor, listener, control_service).await {
-            log::error!("tcp_accept:{e:?}")
-        }
+        tcp_accept(acceptor, listener, control_service).await;
     });
     Ok(())
 }
-async fn tcp_accept(
-    acceptor: TlsAcceptor,
-    listener: TcpListener,
-    control_service: ControlService,
-) -> anyhow::Result<()> {
+async fn tcp_accept(acceptor: TlsAcceptor, listener: TcpListener, control_service: ControlService) {
     loop {
-        let (stream, peer_addr) = listener.accept().await.context("tcp accept error")?;
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                log::error!("tcp accept error: {error}");
+                tokio::time::sleep(crate::server::ACCEPT_ERROR_RETRY_DELAY).await;
+                continue;
+            }
+        };
         log::info!("accept tcp: {peer_addr}");
 
         let acceptor = acceptor.clone();

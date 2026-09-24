@@ -73,12 +73,33 @@ message SubscriptionConfigV1 {
 }
 
 message SubscriptionConfigFetchRequest {
-    string network_code = 1;
-    string device_id = 2;
+    string join_id = 1;
     bytes client_nonce = 3;
     bytes client_proof = 4;
     bytes instance_id = 5;
     uint64 applied_revision = 6;
+}
+
+// Opens the long-lived subscription control connection.  Unlike RegRequestMsg
+// this request never creates a virtual-network/traffic session.
+message SubscriptionRegisterRequest {
+  string join_id = 1;
+  bytes client_nonce = 3;
+  bytes client_proof = 4;
+  bytes instance_id = 5;
+  uint64 applied_revision = 6;
+}
+
+message SubscriptionRegisterResponse {
+  SubscriptionConfigEnvelope config = 1;
+}
+
+message SubscriptionPing {
+  uint64 nonce = 1;
+}
+
+message SubscriptionPong {
+  uint64 nonce = 1;
 }
 
 message SubscriptionConfigEnvelope {
@@ -148,12 +169,15 @@ message ErrorResponseMsg {
 }
 
 message RequestMessage{
-    oneof request_payload{
+  oneof request_payload{
         RegRequestMsg reg = 1;
         ConfirmRegMsg confirm_reg = 2;
         FastRegRequestMsg fast_reg = 3;
-        SubscriptionConfigFetchRequest subscription_config = 4;
-    }
+    SubscriptionConfigFetchRequest subscription_config = 4;
+    SubscriptionRegisterRequest subscription_register = 5;
+    SubscriptionConfigAck subscription_ack = 6;
+    SubscriptionPing subscription_ping = 7;
+  }
 }
 message ResponseMessage{
     oneof response_payload{
@@ -161,8 +185,11 @@ message ResponseMessage{
         ErrorResponseMsg error = 2;
         ConfirmRegResponseMsg confirm_reg = 3;
         FastRegResponseMsg fast_reg = 4;
-        SubscriptionConfigEnvelope subscription_config = 5;
-    }
+    SubscriptionConfigEnvelope subscription_config = 5;
+    SubscriptionRegisterResponse subscription_register = 6;
+    SubscriptionConfigEnvelope subscription_push = 7;
+    SubscriptionPong subscription_pong = 8;
+  }
 }
 
 message SelectiveBroadcast {

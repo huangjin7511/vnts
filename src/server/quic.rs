@@ -26,8 +26,14 @@ pub async fn listen(quic_config: QuicConfig, control_service: ControlService) ->
     let server_crypto = QuicServerConfig::try_from(config)
         .map_err(|e| anyhow::anyhow!("QUIC TLS config error: {:?}", e))?;
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
-    let endpoint = quinn::Endpoint::server(server_config, quic_config.addr)
-        .context(format!("server error:{}", quic_config.addr))?;
+    let runtime = quinn::default_runtime().context("no QUIC async runtime found")?;
+    let endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        crate::utils::net::bind_udp_socket(quic_config.addr)?,
+        runtime,
+    )
+    .context(format!("server error:{}", quic_config.addr))?;
     log::info!("QUIC listening on: {}", quic_config.addr);
 
     tokio::spawn(async move {

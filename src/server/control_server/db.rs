@@ -163,10 +163,19 @@ pub struct ManagedConfigRecord {
     pub device_id: String,
     pub revision: i64,
     pub config_toml: String,
+    /// Per-device control endpoint embedded in its subscription. Empty values
+    /// from records created before this column fall back to the global endpoint.
+    pub subscription_server: String,
+    /// NULL inherits the global traffic server list; Some(empty) explicitly
+    /// falls back to the subscription server.
+    pub traffic_servers_override: Option<Vec<String>>,
     #[serde(skip_serializing)]
     pub credential_key: Option<String>,
     #[serde(skip_serializing)]
     pub subscription: Option<String>,
+    /// 服务端签发的设备唯一订阅接入 ID（UUID）。订阅链接只携带它，
+    /// 客户端经它认证后再从信封获得 network_code/device_id。
+    pub join_id: String,
     pub updated_at: i64,
     /// Authoritative device-table values used to rebuild protected TOML fields.
     #[serde(skip)]
@@ -227,8 +236,26 @@ async fn migrate_managed_config_schema(pool: &SqlitePool) -> anyhow::Result<()> 
     .await?;
     add_column_if_missing(
         pool,
+        "ALTER TABLE vnt_device_configs ADD COLUMN traffic_servers_override TEXT",
+        "traffic_servers_override",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "ALTER TABLE vnt_device_configs ADD COLUMN subscription_server TEXT NOT NULL DEFAULT ''",
+        "subscription_server",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
         "ALTER TABLE vnt_device_configs ADD COLUMN subscription TEXT",
         "subscription",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "ALTER TABLE vnt_device_configs ADD COLUMN join_id TEXT NOT NULL DEFAULT ''",
+        "join_id",
     )
     .await?;
     add_column_if_missing(
@@ -394,8 +421,11 @@ pub async fn init_db_pool() -> anyhow::Result<()> {
             device_id TEXT NOT NULL,
             revision INTEGER NOT NULL,
             config_toml TEXT NOT NULL,
+            subscription_server TEXT NOT NULL DEFAULT '',
+            traffic_servers_override TEXT,
             credential_key TEXT,
             subscription TEXT,
+            join_id TEXT NOT NULL DEFAULT '',
             updated_at INTEGER NOT NULL,
             PRIMARY KEY(network_code, device_id),
             FOREIGN KEY(network_code, device_id)
@@ -405,6 +435,14 @@ pub async fn init_db_pool() -> anyhow::Result<()> {
     .execute(&pool)
     .await
     .context("Failed to create vnt_device_configs table")?;
+
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_vnt_device_configs_join_id_unique
+         ON vnt_device_configs(join_id) WHERE join_id != ''",
+    )
+    .execute(&pool)
+    .await
+    .context("Failed to enforce unique subscription join ids")?;
 
     migrate_managed_config_schema(&pool).await?;
 
@@ -890,8 +928,15 @@ fn managed_record_from_row(row: SqliteRow) -> Result<ManagedConfigRecord, sqlx::
         device_id: row.try_get("device_id")?,
         revision: row.try_get("revision")?,
         config_toml: row.try_get("config_toml")?,
+        subscription_server: row.try_get("subscription_server")?,
+        traffic_servers_override: row
+            .try_get::<Option<String>, _>("traffic_servers_override")?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
         credential_key: row.try_get("credential_key")?,
         subscription: row.try_get("subscription")?,
+        join_id: row.try_get("join_id")?,
         updated_at: row.try_get("updated_at")?,
         configured_device_name: row.try_get("configured_device_name")?,
         configured_ip: row
@@ -915,7 +960,8 @@ pub async fn get_managed_config(
         return Ok(None);
     };
     let row = sqlx::query(
-        "SELECT c.network_code, c.device_id, c.revision, c.config_toml, c.credential_key, c.subscription,
+        "SELECT c.network_code, c.device_id, c.revision, c.config_toml, c.subscription_server, c.traffic_servers_override, c.credential_key, c.subscription,
+                COALESCE(c.join_id, '') AS join_id,
                 c.updated_at, d.device_name AS configured_device_name, d.ip AS configured_ip,
                 CASE WHEN d.ip_type = 2 THEN d.ip ELSE NULL END AS fixed_ip
          FROM vnt_device_configs c
@@ -932,12 +978,68 @@ pub async fn get_managed_config(
         .map_err(Into::into)
 }
 
+/// 按订阅接入 ID 查找受管配置记录。链接被删除设备后此查找必然落空，
+/// 是“删除即失效”的认证入口。
+pub async fn get_managed_config_by_join_id(
+    join_id: &str,
+) -> anyhow::Result<Option<ManagedConfigRecord>> {
+    if join_id.is_empty() {
+        return Ok(None);
+    }
+    let Some(pool) = DB_POOL.get() else {
+        return Ok(None);
+    };
+    let row = sqlx::query(
+        "SELECT c.network_code, c.device_id, c.revision, c.config_toml, c.subscription_server, c.traffic_servers_override, c.credential_key, c.subscription,
+                COALESCE(c.join_id, '') AS join_id,
+                c.updated_at, d.device_name AS configured_device_name, d.ip AS configured_ip,
+                CASE WHEN d.ip_type = 2 THEN d.ip ELSE NULL END AS fixed_ip
+         FROM vnt_device_configs c
+         JOIN devices d ON d.network_code = c.network_code AND d.device_id = c.device_id
+         WHERE c.join_id = ?",
+    )
+    .bind(join_id)
+    .fetch_optional(pool)
+    .await
+    .context("Failed to fetch managed config by join id")?;
+    row.map(managed_record_from_row)
+        .transpose()
+        .map_err(Into::into)
+}
+
+/// 返回设备当前的 join_id；为空时生成 UUID 并落库后返回。
+/// 创建设备之外的编辑路径（客户端配置保存、补签发链接）用它补齐。
+pub async fn ensure_join_id(network_code: &str, device_id: &str) -> anyhow::Result<String> {
+    if let Some(record) = get_managed_config(network_code, device_id).await?
+        && !record.join_id.is_empty()
+    {
+        return Ok(record.join_id);
+    }
+    let join_id = crate::managed_config::new_join_id();
+    let Some(pool) = DB_POOL.get() else {
+        return Ok(join_id);
+    };
+    sqlx::query(
+        "UPDATE vnt_device_configs
+         SET join_id = CASE WHEN join_id IS NULL OR join_id = '' THEN ? ELSE join_id END
+         WHERE network_code = ? AND device_id = ?",
+    )
+    .bind(&join_id)
+    .bind(network_code)
+    .bind(device_id)
+    .execute(pool)
+    .await
+    .context("Failed to assign subscription join id")?;
+    Ok(join_id)
+}
+
 pub async fn list_managed_configs() -> anyhow::Result<Vec<ManagedConfigRecord>> {
     let Some(pool) = DB_POOL.get() else {
         return Ok(Vec::new());
     };
     let rows = sqlx::query(
-        "SELECT c.network_code, c.device_id, c.revision, c.config_toml, c.credential_key, c.subscription,
+        "SELECT c.network_code, c.device_id, c.revision, c.config_toml, c.subscription_server, c.traffic_servers_override, c.credential_key, c.subscription,
+                COALESCE(c.join_id, '') AS join_id,
                 c.updated_at, d.device_name AS configured_device_name, d.ip AS configured_ip,
                 CASE WHEN d.ip_type = 2 THEN d.ip ELSE NULL END AS fixed_ip
          FROM vnt_device_configs c
@@ -958,16 +1060,25 @@ pub async fn create_managed_config(record: &ManagedConfigRecord) -> anyhow::Resu
         .ok_or_else(|| anyhow::anyhow!("订阅链接配置需要启用 persistence"))?;
     sqlx::query(
         "INSERT INTO vnt_device_configs
-         (network_code, device_id, revision, config_toml, credential_key, subscription,
-          updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         (network_code, device_id, revision, config_toml, subscription_server, traffic_servers_override, credential_key, subscription,
+          join_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&record.network_code)
     .bind(&record.device_id)
     .bind(record.revision)
     .bind(&record.config_toml)
+    .bind(&record.subscription_server)
+    .bind(
+        record
+            .traffic_servers_override
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+    )
     .bind(&record.credential_key)
     .bind(&record.subscription)
+    .bind(&record.join_id)
     .bind(record.updated_at)
     .execute(pool)
     .await
@@ -979,6 +1090,7 @@ pub async fn update_managed_config(
     network_code: &str,
     device_id: &str,
     config_toml: &str,
+    join_id: &str,
     updated_at: i64,
 ) -> anyhow::Result<Option<ManagedConfigRecord>> {
     let Some(pool) = DB_POOL.get() else {
@@ -986,11 +1098,13 @@ pub async fn update_managed_config(
     };
     let result = sqlx::query(
         "UPDATE vnt_device_configs
-         SET config_toml = ?, revision = revision + 1, updated_at = ?
+         SET config_toml = ?, revision = revision + 1, updated_at = ?,
+             join_id = CASE WHEN join_id IS NULL OR join_id = '' THEN ? ELSE join_id END
          WHERE network_code = ? AND device_id = ?",
     )
     .bind(config_toml)
     .bind(updated_at)
+    .bind(join_id)
     .bind(network_code)
     .bind(device_id)
     .execute(pool)
@@ -1002,6 +1116,95 @@ pub async fn update_managed_config(
     get_managed_config(network_code, device_id).await
 }
 
+pub async fn update_managed_config_with_endpoints(
+    network_code: &str,
+    device_id: &str,
+    config_toml: &str,
+    subscription_server: &str,
+    traffic_servers_override: Option<&[String]>,
+    join_id: &str,
+    updated_at: i64,
+) -> anyhow::Result<Option<ManagedConfigRecord>> {
+    let Some(pool) = DB_POOL.get() else {
+        return Ok(None);
+    };
+    let encoded = traffic_servers_override
+        .map(serde_json::to_string)
+        .transpose()?;
+    let result = sqlx::query(
+        "UPDATE vnt_device_configs
+         SET config_toml = ?, subscription_server = ?, traffic_servers_override = ?, revision = revision + 1, updated_at = ?,
+             join_id = CASE WHEN join_id IS NULL OR join_id = '' THEN ? ELSE join_id END
+         WHERE network_code = ? AND device_id = ?",
+    )
+    .bind(config_toml)
+    .bind(subscription_server)
+    .bind(encoded)
+    .bind(updated_at)
+    .bind(join_id)
+    .bind(network_code)
+    .bind(device_id)
+    .execute(pool)
+    .await
+    .context("Failed to update managed config endpoints")?;
+    if result.rows_affected() == 0 {
+        return Ok(None);
+    }
+    get_managed_config(network_code, device_id).await
+}
+
+/// Atomically advances every device which inherits the global traffic-server
+/// list. The caller pushes the returned committed records afterwards.
+pub async fn update_inherited_traffic_servers(
+    traffic_servers: &[String],
+    fallback_subscription_server: &str,
+    updated_at: i64,
+) -> anyhow::Result<Vec<ManagedConfigRecord>> {
+    let Some(pool) = DB_POOL.get() else {
+        return Ok(Vec::new());
+    };
+    let effective = if traffic_servers.is_empty() {
+        vec![fallback_subscription_server.to_string()]
+    } else {
+        traffic_servers.to_vec()
+    };
+    let rows = sqlx::query(
+        "SELECT network_code, device_id, config_toml FROM vnt_device_configs
+         WHERE traffic_servers_override IS NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut transaction = pool.begin().await?;
+    for row in rows {
+        let network_code: String = row.try_get("network_code")?;
+        let device_id: String = row.try_get("device_id")?;
+        let source: String = row.try_get("config_toml")?;
+        let mut table: toml::Table = toml::from_str(&source)?;
+        table.insert(
+            "server".to_string(),
+            toml::Value::Array(effective.iter().cloned().map(toml::Value::String).collect()),
+        );
+        let rendered = toml::to_string_pretty(&table)?;
+        sqlx::query(
+            "UPDATE vnt_device_configs
+             SET config_toml = ?, revision = revision + 1, updated_at = ?
+             WHERE network_code = ? AND device_id = ? AND traffic_servers_override IS NULL",
+        )
+        .bind(rendered)
+        .bind(updated_at)
+        .bind(network_code)
+        .bind(device_id)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    transaction.commit().await?;
+    Ok(list_managed_configs()
+        .await?
+        .into_iter()
+        .filter(|record| record.traffic_servers_override.is_none())
+        .collect())
+}
+
 /// Rewrites the persisted representation without changing its semantic revision.
 ///
 /// This is used when legacy or user supplied TOML only differs by comments,
@@ -1010,6 +1213,7 @@ pub async fn rewrite_managed_config(
     network_code: &str,
     device_id: &str,
     config_toml: &str,
+    join_id: &str,
     updated_at: i64,
 ) -> anyhow::Result<Option<ManagedConfigRecord>> {
     let Some(pool) = DB_POOL.get() else {
@@ -1017,11 +1221,13 @@ pub async fn rewrite_managed_config(
     };
     let result = sqlx::query(
         "UPDATE vnt_device_configs
-         SET config_toml = ?, updated_at = ?
+         SET config_toml = ?, updated_at = ?,
+             join_id = CASE WHEN join_id IS NULL OR join_id = '' THEN ? ELSE join_id END
          WHERE network_code = ? AND device_id = ?",
     )
     .bind(config_toml)
     .bind(updated_at)
+    .bind(join_id)
     .bind(network_code)
     .bind(device_id)
     .execute(pool)
@@ -1038,6 +1244,7 @@ pub async fn rotate_subscription_credentials(
     device_id: &str,
     credential_key: &str,
     subscription: &str,
+    join_id: &str,
     updated_at: i64,
 ) -> anyhow::Result<bool> {
     let Some(pool) = DB_POOL.get() else {
@@ -1045,12 +1252,14 @@ pub async fn rotate_subscription_credentials(
     };
     let result = sqlx::query(
         "UPDATE vnt_device_configs
-         SET credential_key = ?, subscription = ?, updated_at = ?
+         SET credential_key = ?, subscription = ?, updated_at = ?,
+             join_id = CASE WHEN join_id IS NULL OR join_id = '' THEN ? ELSE join_id END
          WHERE network_code = ? AND device_id = ?",
     )
     .bind(credential_key)
     .bind(subscription)
     .bind(updated_at)
+    .bind(join_id)
     .bind(network_code)
     .bind(device_id)
     .execute(pool)
@@ -1171,7 +1380,8 @@ mod tests {
         .await
         .unwrap();
 
-        for (device_id, ip) in [("dynamic", "10.0.0.2"), ("managed", "10.0.0.3")] {            sqlx::query("INSERT INTO devices (network_code, device_id, ip) VALUES ('net', ?, ?)")
+        for (device_id, ip) in [("dynamic", "10.0.0.2"), ("managed", "10.0.0.3")] {
+            sqlx::query("INSERT INTO devices (network_code, device_id, ip) VALUES ('net', ?, ?)")
                 .bind(device_id)
                 .bind(ip)
                 .execute(&pool)
@@ -1186,8 +1396,12 @@ mod tests {
         .await
         .unwrap();
 
-        super::release_device_ip_on(&pool, "net", "dynamic").await.unwrap();
-        super::release_device_ip_on(&pool, "net", "managed").await.unwrap();
+        super::release_device_ip_on(&pool, "net", "dynamic")
+            .await
+            .unwrap();
+        super::release_device_ip_on(&pool, "net", "managed")
+            .await
+            .unwrap();
 
         let dynamic_ip: Option<String> = sqlx::query(
             "SELECT ip FROM devices WHERE network_code = 'net' AND device_id = 'dynamic'",

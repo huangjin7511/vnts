@@ -176,8 +176,14 @@ impl PeerServerManager {
         let server_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(config)
             .map_err(|e| anyhow::anyhow!("QUIC TLS config error: {:?}", e))?;
         let server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
-        let endpoint = quinn::Endpoint::server(server_config, bind_addr)
-            .context(format!("peer server error:{}", bind_addr))?;
+        let runtime = quinn::default_runtime().context("no QUIC async runtime found")?;
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            crate::utils::net::bind_udp_socket(bind_addr)?,
+            runtime,
+        )
+        .context(format!("peer server error:{}", bind_addr))?;
 
         log::info!("Peer server listening on: {}", bind_addr);
 

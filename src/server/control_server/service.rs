@@ -4,8 +4,8 @@ use crate::managed_config::{
 };
 use crate::protocol::control_message::{
     RegRequestMsg, RegistrationMode, SubscriptionConfigAck, SubscriptionConfigApplyStatus,
-    SubscriptionConfigEnvelope, SubscriptionConfigFetchRequest, SubscriptionRegistration,
-    SubscriptionServerProof,
+    SubscriptionConfigEnvelope, SubscriptionConfigFetchRequest, SubscriptionRegisterRequest,
+    SubscriptionRegistration, SubscriptionServerProof,
 };
 use crate::server::control_server::db;
 use crate::server::control_server::db::{
@@ -19,6 +19,7 @@ use base64::Engine;
 use bytes::Bytes;
 use bytes::BytesMut;
 use dashmap::DashMap;
+use futures::stream::{FuturesUnordered, StreamExt};
 use ipnet::Ipv4Net;
 use parking_lot::RwLock;
 use rand::RngCore;
@@ -166,6 +167,14 @@ fn validate_registered_revision(applied_revision: u64, server_revision: i64) -> 
     Ok(())
 }
 
+fn ack_can_update_live_state(
+    ack_revision: u64,
+    target_revision: u64,
+    applied_revision: u64,
+) -> bool {
+    ack_revision == target_revision && ack_revision >= applied_revision
+}
+
 #[derive(Clone)]
 struct SubscriptionSessionEntry {
     instance_id: Vec<u8>,
@@ -189,6 +198,7 @@ struct SubscriptionSessionLink {
     /// False only until RegResponse has entered the same reliable outbound
     /// queue. It protects protocol ordering and is never controlled by an ACK.
     registration_complete: bool,
+    control_connection: bool,
 }
 
 /// Sync state observed on a device's live subscription session.
@@ -225,10 +235,15 @@ struct SubscriptionSessionTarget {
     sender: Sender<Bytes>,
     server_proof: SubscriptionServerProof,
     applied_revision: u64,
+    control_connection: bool,
 }
 
 impl SubscriptionSessionEntry {
     fn target(&self, require_complete: bool) -> Option<SubscriptionSessionTarget> {
+        self.targets(require_complete).into_iter().next()
+    }
+
+    fn targets(&self, require_complete: bool) -> Vec<SubscriptionSessionTarget> {
         self.links
             .iter()
             .filter(|(_, link)| !require_complete || link.registration_complete)
@@ -238,8 +253,9 @@ impl SubscriptionSessionEntry {
                 sender: link.sender.clone(),
                 server_proof: link.server_proof.clone(),
                 applied_revision: self.applied_revision,
+                control_connection: link.control_connection,
             })
-            .next()
+            .collect()
     }
 }
 
@@ -330,6 +346,7 @@ impl ControlService {
                 &record.config_toml,
                 &record.configured_device_name,
                 record.fixed_ip.is_some(),
+                Some(record.subscription_server.as_str()).filter(|value| !value.trim().is_empty()),
             ) {
                 Ok(value) => value,
                 Err(error) => {
@@ -363,6 +380,8 @@ impl ControlService {
                     &record.network_code,
                     &record.device_id,
                     &canonical,
+                    // 迁移不初始化 join_id：历史记录留空，编辑或签发时再补赋
+                    &record.join_id,
                     record.updated_at,
                 )
                 .await
@@ -371,6 +390,7 @@ impl ControlService {
                     &record.network_code,
                     &record.device_id,
                     &canonical,
+                    &record.join_id,
                     SystemTime::now()
                         .duration_since(SystemTime::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -514,9 +534,10 @@ impl ControlService {
         let registration_mode = reg_req.registration_mode;
         let allow_ikev2 = reg_req.allow_ikev2;
         let allow_wireguard = reg_req.allow_wireguard;
-        let subscription_registration = (client_type == ClientType::Vnt)
-            .then(|| reg_req.subscription.clone())
-            .flatten();
+        // The experimental subscription extension on ordinary registration is
+        // intentionally ignored. Managed synchronization is authenticated only
+        // by SubscriptionRegister on its dedicated control connection.
+        let subscription_registration = None;
         let claimed_subscription_identity =
             validate_subscription_identity(&reg_req, subscription_registration.as_ref())?;
         let managed_config =
@@ -624,6 +645,7 @@ impl ControlService {
                     sender: managed_sender,
                     server_proof: subscription_server_proof.clone().expect("checked proof"),
                     registration_complete: false,
+                    control_connection: false,
                 };
                 let appended = if !client_instance_id.is_empty() {
                     self.subscription_sessions
@@ -633,9 +655,8 @@ impl ControlService {
                                 && current.client_instance_id == client_instance_id
                             {
                                 current.ip = ip;
-                                current.applied_revision = current
-                                    .applied_revision
-                                    .max(registration.applied_revision);
+                                current.applied_revision =
+                                    current.applied_revision.max(registration.applied_revision);
                                 current.links.insert(random_id, link.clone());
                                 true
                             } else {
@@ -720,10 +741,10 @@ impl ControlService {
         &self,
         request: SubscriptionConfigFetchRequest,
     ) -> anyhow::Result<SubscriptionConfigEnvelope> {
-        let record = db::get_managed_config(&request.network_code, &request.device_id)
+        let record = db::get_managed_config_by_join_id(&request.join_id)
             .await?
             .filter(|record| record.credential_key.is_some())
-            .ok_or_else(|| anyhow::anyhow!("设备尚未生成订阅链接，或已被删除"))?;
+            .ok_or_else(|| anyhow::anyhow!("订阅链接无效，或设备已被删除"))?;
         if request.client_nonce.len() != 32 || request.client_proof.len() != 32 {
             bail!("订阅链接客户端证明无效");
         }
@@ -752,6 +773,73 @@ impl ControlService {
         self.subscription_envelope(&record, proof)
     }
 
+    /// Registers a long-lived subscription control connection without
+    /// allocating an address or joining the traffic network.
+    pub async fn register_subscription_connection(
+        &self,
+        request: SubscriptionRegisterRequest,
+        sender: Sender<Bytes>,
+    ) -> anyhow::Result<(SubscriptionConfigEnvelope, SubscriptionControlSession)> {
+        // The link only carries the join id; the device identity comes from the
+        // authenticated record, never from the request itself.
+        let record = db::get_managed_config_by_join_id(&request.join_id)
+            .await?
+            .filter(|record| record.credential_key.is_some())
+            .context("订阅链接无效，或设备已被删除")?;
+        let registration = SubscriptionRegistration {
+            network_code: record.network_code.clone(),
+            device_id: record.device_id.clone(),
+            client_nonce: request.client_nonce,
+            client_proof: request.client_proof,
+            instance_id: request.instance_id,
+            applied_revision: request.applied_revision,
+        };
+        let proof = authenticate_managed_access(Some(&record), Some(&registration))
+            .context("订阅链接凭据无效或已被重新签发")?;
+        validate_registered_revision(registration.applied_revision, record.revision)?;
+
+        let identity = (record.network_code.clone(), record.device_id.clone());
+        if self
+            .subscription_sessions
+            .get(&identity)
+            .is_some_and(|session| session.instance_id != registration.instance_id)
+        {
+            bail!("该设备已有另一个订阅任务保持连接");
+        }
+        let random_id = rand::random::<u64>();
+        let ip = record.configured_ip.context("受管设备未配置目标 IP")?;
+        self.subscription_sessions.insert(
+            identity.clone(),
+            SubscriptionSessionEntry {
+                instance_id: registration.instance_id,
+                client_instance_id: Vec::new(),
+                runtime_network_code: record.network_code.clone(),
+                ip,
+                applied_revision: registration.applied_revision,
+                apply_error: None,
+                overridden_fields: Vec::new(),
+                links: HashMap::from([(
+                    random_id,
+                    SubscriptionSessionLink {
+                        sender,
+                        server_proof: proof.clone(),
+                        registration_complete: true,
+                        control_connection: true,
+                    },
+                )]),
+            },
+        );
+        let envelope = self.subscription_envelope(&record, proof)?;
+        Ok((
+            envelope,
+            SubscriptionControlSession {
+                identity,
+                random_id,
+                subscription_sessions: self.subscription_sessions.clone(),
+            },
+        ))
+    }
+
     pub fn subscription_envelope(
         &self,
         record: &db::ManagedConfigRecord,
@@ -761,6 +849,7 @@ impl ControlService {
             &record.config_toml,
             &record.configured_device_name,
             record.fixed_ip.is_some(),
+            Some(record.subscription_server.as_str()).filter(|value| !value.trim().is_empty()),
         )
         .with_context(|| {
             format!(
@@ -806,6 +895,15 @@ impl ControlService {
         ack: SubscriptionConfigAck,
     ) -> anyhow::Result<Option<(bool, bool)>> {
         let identity = (network_code.to_string(), device_id.to_string());
+        // ACKs may arrive concurrently through multiple links. Serialize the
+        // complete state-and-database update with registration and other device
+        // mutations so a delayed revision cannot commit after a newer one.
+        let mutation_lock = self
+            .device_mutation_locks
+            .entry(network_code.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _mutation_guard = mutation_lock.lock().await;
         if !self
             .subscription_sessions
             .get(&identity)
@@ -838,34 +936,32 @@ impl ControlService {
         let Some(record) = db::get_managed_config(network_code, device_id).await? else {
             bail!("订阅链接配置确认的设备未启用服务端管理");
         };
-        let ack_revision = ack.revision as i64;
-        if ack_revision > record.revision {
+        let target_revision =
+            u64::try_from(record.revision).context("服务端订阅配置 revision 不能为负数")?;
+        if ack.revision > target_revision {
             bail!("订阅链接配置确认的 revision {} 无效", ack.revision);
         }
-        // A stale ACK for a superseded revision must not describe the current
-        // target, so only an ACK matching the durable revision updates state.
-        if ack_revision == record.revision
-            && let Some(mut entry) = self.subscription_sessions.get_mut(&identity)
+        let mut applied_session = None;
+        if let Some(mut entry) = self.subscription_sessions.get_mut(&identity)
+            && ack_can_update_live_state(ack.revision, target_revision, entry.applied_revision)
         {
             if ack.status == SubscriptionConfigApplyStatus::SubscriptionConfigApplied {
-                entry.applied_revision = entry.applied_revision.max(ack.revision);
+                entry.applied_revision = ack.revision;
+                if has_runtime_metadata {
+                    applied_session = entry.target(false);
+                }
             }
-            entry.apply_error = (!ack.error.is_empty())
-                .then(|| (ack.revision, ack.error.clone()));
+            entry.apply_error = (!ack.error.is_empty()).then(|| (ack.revision, ack.error.clone()));
             entry.overridden_fields = ack.overridden_fields.clone();
+        } else {
+            log::debug!(
+                "忽略设备 {network_code}/{device_id} 的过期配置 ACK revision {}，当前目标 revision {}",
+                ack.revision,
+                target_revision
+            );
         }
-        let applied_session =
-            if ack.status == SubscriptionConfigApplyStatus::SubscriptionConfigApplied {
-                self.subscription_sessions
-                    .get(&identity)
-                    .and_then(|entry| entry.target(false))
-            } else {
-                None
-            };
         let mut runtime_capabilities = None;
-        if let Some(session) = applied_session
-            && has_runtime_metadata
-        {
+        if let Some(session) = applied_session {
             if !ack.effective_ip.is_unspecified() && ack.effective_ip != session.ip {
                 log::warn!(
                     "忽略设备 {network_code}/{device_id} 回执中的不匹配 IP {}，会话 IP 为 {}",
@@ -901,27 +997,26 @@ impl ControlService {
         random_id: u64,
     ) -> anyhow::Result<()> {
         let identity = (network_code.to_string(), device_id.to_string());
-        let session = {
+        let sessions = {
             let Some(mut entry) = self.subscription_sessions.get_mut(&identity) else {
                 return Ok(());
             };
-            let had_complete = entry.links.values().any(|link| link.registration_complete);
             let Some(link) = entry.links.get_mut(&random_id) else {
                 return Ok(());
             };
             link.registration_complete = true;
-            if had_complete {
-                return Ok(());
-            }
-            entry.target(true).expect("activated subscription link")
+            entry.targets(true)
         };
         let Some(record) = db::get_managed_config(network_code, device_id).await? else {
             return Ok(());
         };
-        if record.revision as u64 <= session.applied_revision {
+        if sessions
+            .first()
+            .is_none_or(|session| record.revision as u64 <= session.applied_revision)
+        {
             return Ok(());
         }
-        let status = self.enqueue_subscription_config(&record, &session).await?;
+        let status = self.enqueue_subscription_config(&record, &sessions).await?;
         if status != SubscriptionPushStatus::Queued {
             log::debug!("设备 {network_code}/{device_id} 的注册配置补发未入队: {status:?}");
         }
@@ -933,58 +1028,86 @@ impl ControlService {
         record: &db::ManagedConfigRecord,
     ) -> anyhow::Result<SubscriptionPushStatus> {
         let identity = (record.network_code.clone(), record.device_id.clone());
-        let session = {
+        let sessions = {
             let Some(entry) = self.subscription_sessions.get(&identity) else {
                 return Ok(SubscriptionPushStatus::NotConnected);
             };
-            let Some(target) = entry.target(true) else {
+            let targets = entry.targets(true);
+            if targets.is_empty() {
                 return Ok(SubscriptionPushStatus::Registering);
-            };
-            target
+            }
+            targets
         };
-        self.enqueue_subscription_config(record, &session).await
+        self.enqueue_subscription_config(record, &sessions).await
     }
 
     async fn enqueue_subscription_config(
         &self,
         record: &db::ManagedConfigRecord,
-        session: &SubscriptionSessionTarget,
+        sessions: &[SubscriptionSessionTarget],
     ) -> anyhow::Result<SubscriptionPushStatus> {
         use crate::protocol::ip_packet_protocol::{HEAD_LENGTH, MsgType, NetPacket};
-        let mut proof = session.server_proof.clone();
-        proof.target_revision = record.revision as u64;
-        let payload = self.subscription_envelope(record, proof)?.encode();
-        let mut bytes = BytesMut::zeroed(HEAD_LENGTH + payload.len());
-        let mut packet = NetPacket::new(&mut bytes)?;
-        packet.set_msg_type(MsgType::SubscriptionConfigPush);
-        packet.set_gateway_flag(true);
-        packet.set_ttl(1);
-        packet.set_payload(&payload)?;
-        Ok(Self::enqueue_subscription_payload(
-            &session.sender,
-            bytes.freeze(),
-            SUBSCRIPTION_PUSH_TIMEOUT,
-        )
-        .await)
+        let mut deliveries = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            let mut proof = session.server_proof.clone();
+            proof.target_revision = record.revision as u64;
+            let envelope = self.subscription_envelope(record, proof)?;
+            let bytes = if session.control_connection {
+                crate::protocol::control_message::ResponseMessage::SubscriptionPush(envelope)
+                    .encode()
+                    .freeze()
+            } else {
+                let payload = envelope.encode();
+                let mut bytes = BytesMut::zeroed(HEAD_LENGTH + payload.len());
+                let mut packet = NetPacket::new(&mut bytes)?;
+                packet.set_msg_type(MsgType::SubscriptionConfigPush);
+                packet.set_gateway_flag(true);
+                packet.set_ttl(1);
+                packet.set_payload(&payload)?;
+                bytes.freeze()
+            };
+            deliveries.push((session.sender.clone(), bytes));
+        }
+        Ok(Self::enqueue_subscription_payloads(deliveries, SUBSCRIPTION_PUSH_TIMEOUT).await)
     }
 
+    #[cfg(test)]
     async fn enqueue_subscription_payload(
         sender: &Sender<Bytes>,
         payload: Bytes,
         wait: Duration,
     ) -> SubscriptionPushStatus {
-        // Waiting for bounded-queue capacity is event driven.  A timeout or a
-        // closed channel never rolls back the durable revision; registration
-        // catch-up will send that revision again when the client reconnects.
-        match timeout(wait, sender.send(payload)).await {
-            Ok(Ok(())) => SubscriptionPushStatus::Queued,
-            Ok(Err(error)) => {
-                log::debug!("订阅配置推送连接已关闭，将在客户端重连后补发: {error}");
+        Self::enqueue_subscription_payloads(vec![(sender.clone(), payload)], wait).await
+    }
+
+    async fn enqueue_subscription_payloads(
+        deliveries: Vec<(Sender<Bytes>, Bytes)>,
+        wait: Duration,
+    ) -> SubscriptionPushStatus {
+        let mut reservations = FuturesUnordered::new();
+        for (sender, payload) in deliveries {
+            reservations.push(async move { (sender.reserve_owned().await, payload) });
+        }
+        let delivery = async {
+            while let Some((reservation, payload)) = reservations.next().await {
+                if let Ok(permit) = reservation {
+                    permit.send(payload);
+                    return SubscriptionPushStatus::Queued;
+                }
+            }
+            SubscriptionPushStatus::Closed
+        };
+        match timeout(wait, delivery).await {
+            Ok(SubscriptionPushStatus::Closed) => {
+                log::debug!("订阅配置推送的所有连接均已关闭，将在客户端重连后补发");
                 SubscriptionPushStatus::Closed
             }
+            Ok(status) => status,
             Err(_) => {
+                // The durable revision is not rolled back. Registration catch-up
+                // will retry it if every live link stays backpressured.
                 log::debug!(
-                    "订阅配置推送等待发送队列超过 {} 秒，将在客户端重连后补发",
+                    "订阅配置推送等待所有发送队列超过 {} 秒，将在客户端重连后补发",
                     wait.as_secs()
                 );
                 SubscriptionPushStatus::Timeout
@@ -2065,6 +2188,12 @@ impl ControlService {
 
         db::delete_device(network_code, device_id).await?;
 
+        // The managed-config row (credential + join id) is gone, so any further
+        // register/fetch with the issued link is rejected. Drop a live control
+        // connection too: it would otherwise keep receiving pushes for a device
+        // that no longer exists.
+        self.disconnect_subscription_session(network_code, device_id);
+
         if client_type == Some(ClientType::Ikev2) {
             self.refresh_ikev2_credentials().await;
         }
@@ -2436,7 +2565,8 @@ impl ControlService {
                         rx_bytes: r.rx_bytes as u64,
                         client_type: r.client_type,
                         managed: false,
-                        subscription_session: false,
+                        relay_online: false,
+                        subscription_online: false,
                         subscription_issued: false,
                         subscription_target_revision: None,
                         subscription_applied_revision: None,
@@ -2477,7 +2607,8 @@ impl ControlService {
                     rx_bytes: 0,
                     client_type,
                     managed: false,
-                    subscription_session: false,
+                    relay_online: false,
+                    subscription_online: false,
                     subscription_issued: false,
                     subscription_target_revision: None,
                     subscription_applied_revision: None,
@@ -2501,14 +2632,15 @@ impl ControlService {
                 // client runs.
                 match self.subscription_live_state(network_code, &device.device_id) {
                     Some(live) => {
-                        device.subscription_session = true;
+                        device.subscription_online = true;
                         device.subscription_applied_revision = Some(live.applied_revision as i64);
-                        device.subscription_status = Some(live.status(managed.revision).to_string());
+                        device.subscription_status =
+                            Some(live.status(managed.revision).to_string());
                         device.subscription_error =
                             live.apply_error(managed.revision).map(str::to_string);
                     }
                     None => {
-                        device.subscription_session = false;
+                        device.subscription_online = false;
                         device.subscription_applied_revision = None;
                         device.subscription_status = None;
                         device.subscription_error = None;
@@ -2518,6 +2650,28 @@ impl ControlService {
         }
 
         Some(devices)
+    }
+}
+
+pub struct SubscriptionControlSession {
+    pub identity: (String, String),
+    pub random_id: u64,
+    subscription_sessions: Arc<DashMap<(String, String), SubscriptionSessionEntry>>,
+}
+
+impl Drop for SubscriptionControlSession {
+    fn drop(&mut self) {
+        let remove_entry = self
+            .subscription_sessions
+            .get_mut(&self.identity)
+            .is_some_and(|mut session| {
+                session.links.remove(&self.random_id);
+                session.links.is_empty()
+            });
+        if remove_entry {
+            self.subscription_sessions
+                .remove_if(&self.identity, |_, session| session.links.is_empty());
+        }
     }
 }
 
@@ -2608,8 +2762,11 @@ pub struct DeviceInfoVO {
     pub rx_bytes: u64,
     pub client_type: ClientType,
     pub managed: bool,
-    #[serde(rename = "subscription_session")]
-    pub subscription_session: bool,
+    /// 中继（流量）会话在线：客户端通过本服务器（或其集群）转发数据
+    pub relay_online: bool,
+    /// 订阅控制连接在线：客户端通过订阅链接与本服务器保持配置同步
+    #[serde(rename = "subscription_online")]
+    pub subscription_online: bool,
     pub subscription_issued: bool,
     pub subscription_target_revision: Option<i64>,
     pub subscription_applied_revision: Option<i64>,
@@ -2642,8 +2799,8 @@ fn has_effective_runtime_metadata(ack: &SubscriptionConfigAck) -> bool {
 mod tests {
     use super::{
         ControlService, NetworkConfig, SubscriptionPushStatus, SubscriptionSessionEntry,
-        SubscriptionSessionLink, authenticate_managed_access, first_usable_ip,
-        has_effective_runtime_metadata, network_counts, network_from_gateway,
+        SubscriptionSessionLink, ack_can_update_live_state, authenticate_managed_access,
+        first_usable_ip, has_effective_runtime_metadata, network_counts, network_from_gateway,
         validate_registered_revision, validate_subscription_identity,
     };
     use crate::managed_config::client_proof;
@@ -2688,6 +2845,15 @@ mod tests {
     }
 
     #[test]
+    fn stale_ack_cannot_update_newer_runtime_state() {
+        assert!(ack_can_update_live_state(2, 2, 1));
+        assert!(ack_can_update_live_state(2, 2, 2));
+        assert!(!ack_can_update_live_state(1, 2, 1));
+        assert!(!ack_can_update_live_state(1, 2, 2));
+        assert!(!ack_can_update_live_state(2, 2, 3));
+    }
+
+    #[test]
     fn normal_clients_are_allowed_but_only_valid_subscription_credentials_enable_sync() {
         let credential_key = vec![7_u8; 32];
         let record = ManagedConfigRecord {
@@ -2695,10 +2861,13 @@ mod tests {
             device_id: "dev".into(),
             revision: 1,
             config_toml: String::new(),
+            subscription_server: String::new(),
+            traffic_servers_override: None,
             credential_key: Some(
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&credential_key),
             ),
             subscription: None,
+            join_id: "11111111-2222-3333-4444-555555555555".into(),
             updated_at: 0,
             configured_device_name: "node".into(),
             configured_ip: None,
@@ -2797,6 +2966,7 @@ mod tests {
                             target_revision: 1,
                         },
                         registration_complete: false,
+                        control_connection: false,
                     },
                 )]),
             },
@@ -2806,8 +2976,11 @@ mod tests {
             device_id: identity.1.clone(),
             revision: 2,
             config_toml: String::new(),
+            subscription_server: String::new(),
+            traffic_servers_override: None,
             credential_key: None,
             subscription: None,
+            join_id: "11111111-2222-3333-4444-555555555555".into(),
             updated_at: 0,
             configured_device_name: "managed-device".into(),
             configured_ip: Some("10.73.0.2".parse().unwrap()),
@@ -2873,6 +3046,60 @@ mod tests {
             .await,
             SubscriptionPushStatus::Closed
         );
+    }
+
+    #[tokio::test]
+    async fn subscription_push_falls_back_to_an_available_link() {
+        let (closed_sender, closed_receiver) = mpsc::channel(1);
+        drop(closed_receiver);
+
+        let (blocked_sender, mut blocked_receiver) = mpsc::channel(1);
+        blocked_sender
+            .send(Bytes::from_static(b"occupied"))
+            .await
+            .unwrap();
+
+        let (available_sender, mut available_receiver) = mpsc::channel(1);
+        let status = ControlService::enqueue_subscription_payloads(
+            vec![
+                (closed_sender, Bytes::from_static(b"closed")),
+                (blocked_sender, Bytes::from_static(b"blocked")),
+                (available_sender, Bytes::from_static(b"delivered")),
+            ],
+            Duration::from_millis(10),
+        )
+        .await;
+
+        assert_eq!(status, SubscriptionPushStatus::Queued);
+        assert_eq!(
+            available_receiver.recv().await,
+            Some(Bytes::from_static(b"delivered"))
+        );
+        assert_eq!(
+            blocked_receiver.recv().await,
+            Some(Bytes::from_static(b"occupied"))
+        );
+        assert!(blocked_receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn subscription_push_uses_only_one_available_link() {
+        let (first_sender, mut first_receiver) = mpsc::channel(1);
+        let (second_sender, mut second_receiver) = mpsc::channel(1);
+
+        let status = ControlService::enqueue_subscription_payloads(
+            vec![
+                (first_sender, Bytes::from_static(b"first")),
+                (second_sender, Bytes::from_static(b"second")),
+            ],
+            Duration::from_millis(10),
+        )
+        .await;
+
+        assert_eq!(status, SubscriptionPushStatus::Queued);
+        let delivered = usize::from(first_receiver.try_recv().is_ok())
+            + usize::from(second_receiver.try_recv().is_ok());
+        assert_eq!(delivered, 1);
     }
 
     fn registration(network_code: &str, device_id: &str) -> RegRequestMsg {

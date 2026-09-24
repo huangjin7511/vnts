@@ -19,6 +19,9 @@ use anyhow::bail;
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
+
+pub(crate) const ACCEPT_ERROR_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 pub struct TurnConfig {
     pub tcp_bind: Option<SocketAddr>,

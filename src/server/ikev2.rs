@@ -273,13 +273,11 @@ pub async fn start(config: Ikev2Config, control: ControlService) -> anyhow::Resu
     }
     let certificate = load_certificate(&config)?;
     let ike_socket = Arc::new(
-        UdpSocket::bind(config.ike_bind)
-            .await
+        UdpSocket::from_std(crate::utils::net::bind_udp_socket(config.ike_bind)?)
             .with_context(|| format!("failed to bind IKEv2 socket {}", config.ike_bind))?,
     );
     let natt_socket = Arc::new(
-        UdpSocket::bind(config.natt_bind)
-            .await
+        UdpSocket::from_std(crate::utils::net::bind_udp_socket(config.natt_bind)?)
             .with_context(|| format!("failed to bind IKEv2 NAT-T socket {}", config.natt_bind))?,
     );
 

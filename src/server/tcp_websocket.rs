@@ -26,16 +26,13 @@ pub async fn listen(config: HybridConfig, control_service: ControlService) -> an
 
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
-    let listener = TcpListener::bind(config.addr)
-        .await
+    let listener = TcpListener::from_std(crate::utils::net::bind_tcp_listener(config.addr)?)
         .context(format!("bind error:{}", config.addr))?;
 
     log::info!("TCP/WebSocket listening on: {} (TLS)", config.addr);
 
     tokio::spawn(async move {
-        if let Err(e) = hybrid_accept(tls_acceptor, listener, control_service).await {
-            log::error!("hybrid_accept:{e:?}")
-        }
+        hybrid_accept(tls_acceptor, listener, control_service).await;
     });
 
     Ok(())
@@ -45,9 +42,16 @@ async fn hybrid_accept(
     tls_acceptor: TlsAcceptor,
     listener: TcpListener,
     control_service: ControlService,
-) -> anyhow::Result<()> {
+) {
     loop {
-        let (stream, peer_addr) = listener.accept().await.context("tcp accept error")?;
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                log::error!("hybrid tcp accept error: {error}");
+                tokio::time::sleep(crate::server::ACCEPT_ERROR_RETRY_DELAY).await;
+                continue;
+            }
+        };
         log::info!("accept connection: {peer_addr}");
 
         let tls_acceptor = tls_acceptor.clone();
