@@ -52,7 +52,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', handleBeforeUnl
 </script>
 
 <template>
-  <div class="mx-auto max-w-5xl">
+  <div class="w-full">
     <div class="mb-4 grid grid-cols-2 gap-2 lg:hidden" role="tablist" aria-label="设置分区">
       <button
         v-for="section in sections"
