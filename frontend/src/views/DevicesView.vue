@@ -474,19 +474,22 @@ const subscriptionQr = ref('')
 
 async function showSubscription(link: string) {
   subscription.value = link
-  subscriptionQr.value = await QRCode.toDataURL(link, { width: 260, margin: 1 })
+  try {
+    subscriptionQr.value = await QRCode.toDataURL(link, { width: 320, margin: 1 })
+  } catch {
+    subscriptionQr.value = ''
+  }
 }
 
-async function copyVntSubscription(group: DeviceGroup) {
+async function openVntSubscription(group: DeviceGroup) {
   const device = localDevice(group)
   if (!device || device.client_type !== 'VNT') return
   try {
     const result = await managedDeviceApi.subscription(networkCode.value, device.device_id)
-    await copyText(result.subscription)
-    toast.success('订阅链接已复制到剪贴板')
+    await showSubscription(result.subscription)
     void monitor.load(networkCode.value)
   } catch (error) {
-    toast.error(error instanceof ApiError ? error.message : '复制订阅链接失败')
+    toast.error(error instanceof ApiError ? error.message : '获取订阅链接失败')
   }
 }
 
@@ -712,8 +715,8 @@ async function executeDelete() {
                   <button
                     v-if="localDevice(group)?.client_type === 'VNT'"
                     class="flex h-7 w-7 items-center justify-center rounded-lg text-violet-500 transition hover:bg-violet-50 hover:text-violet-700 dark:hover:bg-violet-500/10"
-                    title="复制订阅链接"
-                    @click="copyVntSubscription(group)"
+                    title="订阅链接二维码"
+                    @click="openVntSubscription(group)"
                   ><KeyRound :size="15" /></button>
                   <button
                     v-if="localDevice(group)?.client_type === 'IKEV2'"
@@ -959,12 +962,12 @@ async function executeDelete() {
       </form>
     </BaseModal>
 
-    <BaseModal :open="Boolean(subscription)" title="设备订阅链接" @close="subscription = ''">
+    <BaseModal :open="Boolean(subscription)" title="设备订阅链接" @close="subscription = ''; subscriptionQr = ''">
       <div class="space-y-4 text-center">
-        <img v-if="subscriptionQr" :src="subscriptionQr" alt="订阅链接二维码" class="mx-auto h-64 w-64 rounded-lg" />
+        <img v-if="subscriptionQr" :src="subscriptionQr" alt="订阅链接二维码" class="mx-auto h-80 w-80 rounded-lg" />
         <textarea :value="subscription" readonly rows="4" class="field w-full break-all font-mono text-xs" />
         <button class="primary-button mx-auto" @click="copyCredential(subscription)"><Clipboard :size="15" />复制订阅链接</button>
-        <p class="text-xs text-slate-500">以后可直接点击设备行的钥匙按钮再次复制，请勿发送到不可信渠道。</p>
+        <p class="text-xs text-slate-500">VNT 客户端扫描二维码即可添加订阅配置；点击设备行的钥匙按钮可随时重新打开，请勿发送到不可信渠道。</p>
       </div>
     </BaseModal>
 
