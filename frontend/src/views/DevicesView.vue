@@ -263,6 +263,16 @@ function onlineVntSyncState(group: DeviceGroup): 'available' | 'unavailable' | n
   return device.subscription_online ? 'available' : 'unavailable'
 }
 
+function subscriptionOnlyOnline(group: DeviceGroup) {
+  const device = localDevice(group)
+  return (
+    device?.client_type === 'VNT' &&
+    device.managed &&
+    !device.relay_online &&
+    device.subscription_online
+  )
+}
+
 function vntSyncTooltip(group: DeviceGroup) {
   const device = localDevice(group)
   if (!device) return ''
@@ -593,26 +603,12 @@ async function executeDelete() {
                 <div class="flex flex-wrap items-center gap-1.5">
                   <StatusBadge :status="group.hasOnline ? 'Online' : group.hasRemote ? 'Remote' : 'Offline'" />
                   <span
-                    v-if="localDevice(group)?.client_type === 'VNT' && localDevice(group)?.managed"
-                    class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold"
-                    :class="localDevice(group)?.relay_online
-                      ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300'
-                      : 'bg-slate-100 text-slate-500 dark:bg-slate-700 dark:text-slate-400'"
-                    :title="localDevice(group)?.relay_online ? '中继（流量）会话在线' : '中继（流量）会话离线'"
-                  >
-                    <span class="h-1.5 w-1.5 rounded-full" :class="localDevice(group)?.relay_online ? 'bg-emerald-500' : 'bg-slate-400'" />
-                    中继{{ localDevice(group)?.relay_online ? '在线' : '离线' }}
-                  </span>
-                  <span
-                    v-if="localDevice(group)?.client_type === 'VNT' && localDevice(group)?.managed"
-                    class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold"
-                    :class="localDevice(group)?.subscription_online
-                      ? 'bg-violet-50 text-violet-700 dark:bg-violet-500/10 dark:text-violet-300'
-                      : 'bg-slate-100 text-slate-500 dark:bg-slate-700 dark:text-slate-400'"
+                    v-if="subscriptionOnlyOnline(group)"
+                    class="inline-flex items-center gap-1 rounded-full bg-violet-50 px-2 py-0.5 text-[10px] font-semibold text-violet-700 dark:bg-violet-500/10 dark:text-violet-300"
                     :title="vntSyncTooltip(group)"
                   >
-                    <span class="h-1.5 w-1.5 rounded-full" :class="localDevice(group)?.subscription_online ? 'bg-violet-500' : 'bg-slate-400'" />
-                    订阅{{ localDevice(group)?.subscription_online ? '在线' : '离线' }}
+                    <span class="h-1.5 w-1.5 rounded-full bg-violet-500" />
+                    订阅在线
                   </span>
                 </div>
               </td>
