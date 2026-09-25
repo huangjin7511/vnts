@@ -436,6 +436,11 @@ pub async fn init_db_pool() -> anyhow::Result<()> {
     .await
     .context("Failed to create vnt_device_configs table")?;
 
+    // The join_id unique index below references a column that databases
+    // created by earlier releases don't have yet, so upgrade the table
+    // before enforcing uniqueness.
+    migrate_managed_config_schema(&pool).await?;
+
     sqlx::query(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_vnt_device_configs_join_id_unique
          ON vnt_device_configs(join_id) WHERE join_id != ''",
@@ -443,8 +448,6 @@ pub async fn init_db_pool() -> anyhow::Result<()> {
     .execute(&pool)
     .await
     .context("Failed to enforce unique subscription join ids")?;
-
-    migrate_managed_config_schema(&pool).await?;
 
     let _ = DB_POOL.set(pool);
     Ok(())
