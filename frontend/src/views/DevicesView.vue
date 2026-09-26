@@ -84,6 +84,7 @@ const formSubmitting = ref(false)
 const pendingCreateIpSuggestion = ref(false)
 const vntAdvancedToml = ref('')
 const vntAdvancedError = ref('')
+const vntSubscriptionServer = ref('')
 
 const deviceForm = ref({
   device_id: '',
@@ -216,21 +217,13 @@ async function copyCredential(value: string) {
 async function loadVntAccessDefaults() {
   try {
     const settings = await settingsApi.getClientAccess()
-    const configured = settings.server.map((server) => server.trim()).filter(Boolean)
-    if (configured.length) {
-      deviceForm.value.vnt_config.current_server = configured[0]
-      deviceForm.value.vnt_config.other_servers = configured.slice(1)
-    } else {
-      const host = window.location.hostname
-      const formattedHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host
-      const listeners = settings.listener_ports
-      const candidate = ([
-        ['tcp', listeners?.tcp], ['quic', listeners?.quic], ['wss', listeners?.wss],
-      ] as const).find(([, port]) => typeof port === 'number' && port > 0)
-      deviceForm.value.vnt_config.current_server = candidate ? `${candidate[0]}://${formattedHost}:${candidate[1]}` : ''
-      deviceForm.value.vnt_config.other_servers = []
-    }
-    deviceForm.value.vnt_config.cert_mode = 'finger'
+    vntSubscriptionServer.value = settings.subscription_server.trim()
+    const configured = (settings.traffic_servers.length
+      ? settings.traffic_servers
+      : [settings.subscription_server]
+    ).map((server) => server.trim()).filter(Boolean)
+    deviceForm.value.vnt_config.current_server = configured[0] ?? ''
+    deviceForm.value.vnt_config.other_servers = configured.slice(1)
   } catch {
     // 输入框保持为空，由用户在当前设备上填写。
   }
@@ -253,6 +246,7 @@ async function openCreateDevice() {
   pendingCreateIpSuggestion.value = suggestedIp === undefined
   generateDeviceId()
   showIkev2Password.value = false
+  vntSubscriptionServer.value = ''
   await loadVntAccessDefaults()
   vntAdvancedToml.value = ADVANCED_CONFIG_TEMPLATE
   vntAdvancedError.value = ''
@@ -266,13 +260,23 @@ function localDevice(group: DeviceGroup) {
 function onlineVntSyncState(group: DeviceGroup): 'available' | 'unavailable' | null {
   const device = localDevice(group)
   if (device?.client_type !== 'VNT' || device.status !== 'Online') return null
-  return device.subscription_session ? 'available' : 'unavailable'
+  return device.subscription_online ? 'available' : 'unavailable'
+}
+
+function subscriptionOnlyOnline(group: DeviceGroup) {
+  const device = localDevice(group)
+  return (
+    device?.client_type === 'VNT' &&
+    device.managed &&
+    !device.relay_online &&
+    device.subscription_online
+  )
 }
 
 function vntSyncTooltip(group: DeviceGroup) {
   const device = localDevice(group)
   if (!device) return ''
-  const state = device.subscription_session
+  const state = device.subscription_online
     ? '订阅链接实时同步已连接'
     : device.subscription_issued
       ? '当前连接未使用订阅链接，无法实时同步'
@@ -311,6 +315,7 @@ async function openEditDevice(group: DeviceGroup) {
     try {
       const managed = await managedDeviceApi.get(networkCode.value, device.device_id)
       deviceForm.value.vnt_config = managed.client_config
+      vntSubscriptionServer.value = managed.subscription_server
       vntAdvancedToml.value = managed.advanced_config_toml
     } catch (error) {
       showDeviceModal.value = false
@@ -333,11 +338,8 @@ async function submitDevice() {
   if (deviceForm.value.client_type === 'VNT') {
     const currentServer = deviceForm.value.vnt_config.current_server.trim()
     const otherServers = deviceForm.value.vnt_config.other_servers.map((server) => server.trim()).filter(Boolean)
-    if (!currentServer) {
-      toast.error('请填写当前服务器地址')
-      return
-    }
-    if (new Set([currentServer, ...otherServers]).size !== otherServers.length + 1) {
+    const trafficServers = [currentServer, ...otherServers].filter(Boolean)
+    if (new Set(trafficServers).size !== trafficServers.length) {
       toast.error('服务器地址不能重复')
       return
     }
@@ -362,9 +364,8 @@ async function submitDevice() {
           networkCode.value,
           deviceForm.value.device_id,
           advancedToml,
-          deviceForm.value.vnt_config.current_server,
-          deviceForm.value.vnt_config.other_servers,
-          deviceForm.value.vnt_config.cert_mode,
+          vntSubscriptionServer.value.trim(),
+          [deviceForm.value.vnt_config.current_server, ...deviceForm.value.vnt_config.other_servers].filter(Boolean),
           deviceForm.value.device_name,
           deviceForm.value.ip,
           deviceForm.value.ip_type,
@@ -426,9 +427,8 @@ async function submitDevice() {
           ip: deviceForm.value.ip,
           ip_type: deviceForm.value.ip_type,
           config_toml: advancedToml,
-          current_server: deviceForm.value.vnt_config.current_server,
-          other_servers: deviceForm.value.vnt_config.other_servers,
-          cert_mode: deviceForm.value.vnt_config.cert_mode,
+          subscription_server: vntSubscriptionServer.value.trim(),
+          traffic_servers_override: [deviceForm.value.vnt_config.current_server, ...deviceForm.value.vnt_config.other_servers].filter(Boolean),
         })
         managedMutation = result
         if (result.subscription) await showSubscription(result.subscription)
@@ -474,19 +474,22 @@ const subscriptionQr = ref('')
 
 async function showSubscription(link: string) {
   subscription.value = link
-  subscriptionQr.value = await QRCode.toDataURL(link, { width: 260, margin: 1 })
+  try {
+    subscriptionQr.value = await QRCode.toDataURL(link, { width: 320, margin: 1 })
+  } catch {
+    subscriptionQr.value = ''
+  }
 }
 
-async function copyVntSubscription(group: DeviceGroup) {
+async function openVntSubscription(group: DeviceGroup) {
   const device = localDevice(group)
   if (!device || device.client_type !== 'VNT') return
   try {
     const result = await managedDeviceApi.subscription(networkCode.value, device.device_id)
-    await copyText(result.subscription)
-    toast.success('订阅链接已复制到剪贴板')
+    await showSubscription(result.subscription)
     void monitor.load(networkCode.value)
   } catch (error) {
-    toast.error(error instanceof ApiError ? error.message : '复制订阅链接失败')
+    toast.error(error instanceof ApiError ? error.message : '获取订阅链接失败')
   }
 }
 
@@ -600,7 +603,17 @@ async function executeDelete() {
                 </div>
               </td>
               <td class="px-4 py-3">
-                <StatusBadge :status="group.hasOnline ? 'Online' : group.hasRemote ? 'Remote' : 'Offline'" />
+                <div class="flex flex-wrap items-center gap-1.5">
+                  <StatusBadge :status="group.hasOnline ? 'Online' : group.hasRemote ? 'Remote' : 'Offline'" />
+                  <span
+                    v-if="subscriptionOnlyOnline(group)"
+                    class="inline-flex items-center gap-1 rounded-full bg-violet-50 px-2 py-0.5 text-[10px] font-semibold text-violet-700 dark:bg-violet-500/10 dark:text-violet-300"
+                    :title="vntSyncTooltip(group)"
+                  >
+                    <span class="h-1.5 w-1.5 rounded-full bg-violet-500" />
+                    订阅在线
+                  </span>
+                </div>
               </td>
               <td class="px-4 py-3">
                 <div class="flex items-center gap-2 font-medium text-slate-900 dark:text-slate-100">
@@ -702,8 +715,8 @@ async function executeDelete() {
                   <button
                     v-if="localDevice(group)?.client_type === 'VNT'"
                     class="flex h-7 w-7 items-center justify-center rounded-lg text-violet-500 transition hover:bg-violet-50 hover:text-violet-700 dark:hover:bg-violet-500/10"
-                    title="复制订阅链接"
-                    @click="copyVntSubscription(group)"
+                    title="订阅链接二维码"
+                    @click="openVntSubscription(group)"
                   ><KeyRound :size="15" /></button>
                   <button
                     v-if="localDevice(group)?.client_type === 'IKEV2'"
@@ -840,32 +853,29 @@ async function executeDelete() {
           <div>
             <h4 class="text-sm font-semibold text-slate-800 dark:text-slate-100">VNT 客户端配置</h4>
             <p class="mt-1 text-xs leading-5 text-slate-500 dark:text-slate-400">
-              {{ editingDevice?.subscription_session ? '该客户端通过订阅链接接入，保存后会立即推送；实际应用结果会显示在设备状态中。' : '当前没有通过订阅链接验证的同步连接；配置会保存在服务端，客户端下次使用订阅链接启动时会获取。' }}
+              {{ editingDevice?.subscription_online ? '该客户端通过订阅链接接入，保存后会立即推送；实际应用结果会显示在设备状态中。' : '当前没有通过订阅链接验证的同步连接；配置会保存在服务端，客户端下次使用订阅链接启动时会获取。' }}
             </p>
           </div>
           <div class="grid gap-4 sm:grid-cols-2">
             <div class="sm:col-span-2">
-              <div class="mb-1.5 flex items-center justify-between gap-3">
-                <label class="text-sm font-medium text-slate-700 dark:text-slate-300">当前服务器地址</label>
-              </div>
-              <input v-model.trim="deviceForm.vnt_config.current_server" type="text" :class="inputClass" placeholder="tcp://vpn.example.com:29872" required />
+              <label class="mb-1.5 block text-sm font-medium text-slate-700 dark:text-slate-300">订阅服务器地址</label>
+              <input v-model.trim="vntSubscriptionServer" type="text" :class="inputClass" placeholder="tcp://vpn.example.com:29872" />
+              <p class="mt-1.5 text-xs text-slate-400">留空时使用“客户端接入”中配置的订阅服务器。</p>
+            </div>
+            <div class="sm:col-span-2">
+              <label class="mb-1.5 block text-sm font-medium text-slate-700 dark:text-slate-300">流量服务器地址</label>
+              <input v-model.trim="deviceForm.vnt_config.current_server" type="text" :class="inputClass" placeholder="quic://vpn.example.com:29872" />
+              <p class="mt-1.5 text-xs text-slate-400">留空时使用上面的订阅服务器地址。</p>
               <div class="mb-1.5 mt-4 flex items-center justify-between gap-3">
-                <label class="text-sm font-medium text-slate-700 dark:text-slate-300">其他服务器地址</label>
+                <label class="text-sm font-medium text-slate-700 dark:text-slate-300">其他流量服务器地址</label>
                 <button type="button" class="flex items-center gap-1 text-xs text-blue-600 hover:text-blue-700" @click="deviceForm.vnt_config.other_servers.push('')"><Plus :size="13" />添加地址</button>
               </div>
               <div class="space-y-2">
                 <div v-for="(_, index) in deviceForm.vnt_config.other_servers" :key="index" class="flex gap-2">
-                  <input v-model.trim="deviceForm.vnt_config.other_servers[index]" type="text" :class="inputClass" placeholder="quic://vpn.example.com:29872" required />
+                  <input v-model.trim="deviceForm.vnt_config.other_servers[index]" type="text" :class="inputClass" placeholder="quic://vpn.example.com:29872" />
                   <button type="button" class="rounded-lg border border-slate-200 px-3 text-slate-400 hover:text-red-500 dark:border-slate-600" title="删除其他服务器地址" @click="deviceForm.vnt_config.other_servers.splice(index, 1)"><Trash2 :size="15" /></button>
                 </div>
               </div>
-            </div>
-            <div>
-              <label class="mb-1.5 block text-sm font-medium text-slate-700 dark:text-slate-300">证书校验</label>
-              <select v-model="deviceForm.vnt_config.cert_mode" :class="inputClass">
-                <option value="finger">校验服务端证书指纹</option>
-                <option value="standard">使用系统受信任证书</option>
-              </select>
             </div>
           </div>
 
@@ -952,12 +962,12 @@ async function executeDelete() {
       </form>
     </BaseModal>
 
-    <BaseModal :open="Boolean(subscription)" title="设备订阅链接" @close="subscription = ''">
+    <BaseModal :open="Boolean(subscription)" title="设备订阅链接" @close="subscription = ''; subscriptionQr = ''">
       <div class="space-y-4 text-center">
-        <img v-if="subscriptionQr" :src="subscriptionQr" alt="订阅链接二维码" class="mx-auto h-64 w-64 rounded-lg" />
+        <img v-if="subscriptionQr" :src="subscriptionQr" alt="订阅链接二维码" class="mx-auto h-80 w-80 rounded-lg" />
         <textarea :value="subscription" readonly rows="4" class="field w-full break-all font-mono text-xs" />
         <button class="primary-button mx-auto" @click="copyCredential(subscription)"><Clipboard :size="15" />复制订阅链接</button>
-        <p class="text-xs text-slate-500">以后可直接点击设备行的钥匙按钮再次复制，请勿发送到不可信渠道。</p>
+        <p class="text-xs text-slate-500">VNT 客户端扫描二维码即可添加订阅配置；点击设备行的钥匙按钮可随时重新打开，请勿发送到不可信渠道。</p>
       </div>
     </BaseModal>
 

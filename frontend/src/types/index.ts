@@ -57,7 +57,10 @@ export interface DeviceInfo {
   tx_speed?: number
   rx_speed?: number
   managed: boolean
-  subscription_session: boolean
+  /** 中继（流量）会话在线 */
+  relay_online: boolean
+  /** 订阅控制连接在线 */
+  subscription_online: boolean
   subscription_issued: boolean
   subscription_target_revision: number | null
   subscription_applied_revision: number | null
@@ -189,8 +192,8 @@ export interface NetworkWhitelistSettings {
 }
 
 export interface ClientAccessSettings {
-  server: string[]
-  cert_mode: string
+  subscription_server: string
+  traffic_servers: string[]
   listener_ports?: {
     tcp: number | null
     quic: number | null
@@ -210,6 +213,10 @@ export interface ManagedConfig {
   overridden_fields: string[]
   updated_at: number
   subscription_issued: boolean
+  subscription_server: string
+  traffic_servers_override: string[] | null
+  inherits_traffic_servers: boolean
+  effective_traffic_servers: string[]
   client_config: VntClientConfig
 }
 
@@ -259,8 +266,7 @@ export interface CreateManagedDevicePayload {
   ip: string
   ip_type: DeviceIpType
   config_toml: string
-  current_server: string
-  other_servers: string[]
-  cert_mode: 'standard' | 'finger'
+  subscription_server: string
+  traffic_servers_override: string[]
   client_type?: 'VNT'
 }

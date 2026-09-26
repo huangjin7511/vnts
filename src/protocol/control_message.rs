@@ -213,8 +213,7 @@ impl SubscriptionServerProof {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SubscriptionConfigFetchRequest {
-    pub network_code: String,
-    pub device_id: String,
+    pub join_id: String,
     pub client_nonce: Vec<u8>,
     pub client_proof: Vec<u8>,
     pub instance_id: Vec<u8>,
@@ -224,8 +223,7 @@ pub struct SubscriptionConfigFetchRequest {
 impl SubscriptionConfigFetchRequest {
     fn from(msg: proto::SubscriptionConfigFetchRequest) -> Self {
         Self {
-            network_code: msg.network_code,
-            device_id: msg.device_id,
+            join_id: msg.join_id,
             client_nonce: msg.client_nonce,
             client_proof: msg.client_proof,
             instance_id: msg.instance_id,
@@ -234,14 +232,39 @@ impl SubscriptionConfigFetchRequest {
     }
     fn to(self) -> proto::SubscriptionConfigFetchRequest {
         proto::SubscriptionConfigFetchRequest {
-            network_code: self.network_code,
-            device_id: self.device_id,
+            join_id: self.join_id,
             client_nonce: self.client_nonce,
             client_proof: self.client_proof,
             instance_id: self.instance_id,
             applied_revision: self.applied_revision,
         }
     }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SubscriptionRegisterRequest {
+    pub join_id: String,
+    pub client_nonce: Vec<u8>,
+    pub client_proof: Vec<u8>,
+    pub instance_id: Vec<u8>,
+    pub applied_revision: u64,
+}
+
+impl SubscriptionRegisterRequest {
+    fn from(msg: proto::SubscriptionRegisterRequest) -> Self {
+        Self {
+            join_id: msg.join_id,
+            client_nonce: msg.client_nonce,
+            client_proof: msg.client_proof,
+            instance_id: msg.instance_id,
+            applied_revision: msg.applied_revision,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SubscriptionPing {
+    pub nonce: u64,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -321,6 +344,33 @@ impl SubscriptionConfigAck {
             allow_mapping: msg.allow_mapping,
             effective_config_sha256: msg.effective_config_sha256,
         })
+    }
+
+    fn from_proto(msg: proto::SubscriptionConfigAck) -> anyhow::Result<Self> {
+        Self::from_slice(msg.encode_to_vec().as_ref())
+    }
+
+    fn to(self) -> proto::SubscriptionConfigAck {
+        proto::SubscriptionConfigAck {
+            revision: self.revision,
+            status: self.status as i32,
+            error: self.error,
+            overridden_fields: self.overridden_fields,
+            apply_mode: self.apply_mode,
+            changed_fields: self.changed_fields,
+            effective_device_name: self.effective_device_name,
+            effective_ip: self.effective_ip.into(),
+            effective_prefix_len: self.effective_prefix_len,
+            effective_output: self
+                .effective_output
+                .into_iter()
+                .map(ipv4_subnet_to_proto)
+                .collect(),
+            allow_ikev2: self.allow_ikev2,
+            allow_wireguard: self.allow_wireguard,
+            allow_mapping: self.allow_mapping,
+            effective_config_sha256: self.effective_config_sha256,
+        }
     }
 }
 
@@ -461,6 +511,9 @@ pub enum RequestMessage {
     ConfirmReg(ConfirmRegMsg),
     FastReg(FastRegRequestMsg),
     SubscriptionConfig(SubscriptionConfigFetchRequest),
+    SubscriptionRegister(SubscriptionRegisterRequest),
+    SubscriptionAck(SubscriptionConfigAck),
+    SubscriptionPing(SubscriptionPing),
 }
 impl RequestMessage {
     pub fn from_slice(buf: &[u8]) -> anyhow::Result<Self> {
@@ -479,6 +532,17 @@ impl RequestMessage {
             RequestPayload::SubscriptionConfig(request) => Ok(RequestMessage::SubscriptionConfig(
                 SubscriptionConfigFetchRequest::from(request),
             )),
+            RequestPayload::SubscriptionRegister(request) => Ok(
+                RequestMessage::SubscriptionRegister(SubscriptionRegisterRequest::from(request)),
+            ),
+            RequestPayload::SubscriptionAck(ack) => Ok(RequestMessage::SubscriptionAck(
+                SubscriptionConfigAck::from_proto(ack)?,
+            )),
+            RequestPayload::SubscriptionPing(ping) => {
+                Ok(RequestMessage::SubscriptionPing(SubscriptionPing {
+                    nonce: ping.nonce,
+                }))
+            }
         }
     }
     pub fn encode(self) -> BytesMut {
@@ -488,6 +552,11 @@ impl RequestMessage {
             RequestMessage::FastReg(fast_reg) => RequestPayload::FastReg(fast_reg.to()),
             RequestMessage::SubscriptionConfig(request) => {
                 RequestPayload::SubscriptionConfig(request.to())
+            }
+            RequestMessage::SubscriptionRegister(_) => unreachable!("server-only decode"),
+            RequestMessage::SubscriptionAck(ack) => RequestPayload::SubscriptionAck(ack.to()),
+            RequestMessage::SubscriptionPing(ping) => {
+                RequestPayload::SubscriptionPing(proto::SubscriptionPing { nonce: ping.nonce })
             }
         };
         proto::RequestMessage {
@@ -503,6 +572,9 @@ pub enum ResponseMessage {
     ConfirmReg(ConfirmRegResponseMsg),
     FastReg(FastRegResponseMsg),
     SubscriptionConfig(SubscriptionConfigEnvelope),
+    SubscriptionRegister(SubscriptionConfigEnvelope),
+    SubscriptionPush(SubscriptionConfigEnvelope),
+    SubscriptionPong(SubscriptionPing),
 }
 impl ResponseMessage {
     pub fn encode(self) -> BytesMut {
@@ -513,6 +585,17 @@ impl ResponseMessage {
             ResponseMessage::FastReg(fast_reg) => ResponsePayload::FastReg(fast_reg.to()),
             ResponseMessage::SubscriptionConfig(config) => {
                 ResponsePayload::SubscriptionConfig(config.to())
+            }
+            ResponseMessage::SubscriptionRegister(config) => {
+                ResponsePayload::SubscriptionRegister(proto::SubscriptionRegisterResponse {
+                    config: Some(config.to()),
+                })
+            }
+            ResponseMessage::SubscriptionPush(config) => {
+                ResponsePayload::SubscriptionPush(config.to())
+            }
+            ResponseMessage::SubscriptionPong(pong) => {
+                ResponsePayload::SubscriptionPong(proto::SubscriptionPong { nonce: pong.nonce })
             }
         };
         proto::ResponseMessage {

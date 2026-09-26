@@ -35,58 +35,72 @@ pub struct ConfigFile {
     pub client_access: ClientAccessConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
 pub struct ClientAccessConfig {
-    /// Public VNT endpoints embedded in newly issued subscriptions.
+    /// The one control endpoint embedded in newly issued subscriptions.
     #[serde(default)]
-    pub server: Vec<String>,
-    /// `standard`, `finger`, or `finger:<sha256>`. `finger` is resolved to the
-    /// certificate fingerprint when a subscription is issued.
-    #[serde(default = "default_client_cert_mode")]
-    pub cert_mode: String,
-}
-
-fn default_client_cert_mode() -> String {
-    "finger".to_string()
-}
-
-impl Default for ClientAccessConfig {
-    fn default() -> Self {
-        Self {
-            server: Vec::new(),
-            cert_mode: default_client_cert_mode(),
-        }
-    }
+    pub subscription_server: String,
+    /// Default data-plane endpoints. An empty list means the subscription endpoint.
+    #[serde(default)]
+    pub traffic_servers: Vec<String>,
 }
 
 impl ClientAccessConfig {
+    pub fn new(subscription_server: String, traffic_servers: Vec<String>) -> Self {
+        Self {
+            subscription_server,
+            traffic_servers,
+        }
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.server.is_empty() {
-            anyhow::bail!("client_access.server 至少需要一个公网服务端地址");
+        if self.effective_subscription_server().is_empty() {
+            anyhow::bail!("client_access.subscription_server 不能为空");
         }
         self.validate_optional()
     }
 
     pub fn validate_optional(&self) -> anyhow::Result<()> {
-        let mut unique = HashSet::new();
-        for endpoint in &self.server {
-            let trimmed = endpoint.trim();
-            if trimmed.is_empty() || endpoint != trimmed {
-                anyhow::bail!("client_access.server 包含无效地址");
+        let subscription_server = self.effective_subscription_server();
+        if subscription_server.is_empty() && !self.effective_traffic_servers().is_empty() {
+            anyhow::bail!("配置 client_access.traffic_servers 前必须先配置 subscription_server");
+        }
+        if !subscription_server.is_empty() {
+            let trimmed = subscription_server.trim();
+            if trimmed.is_empty() || subscription_server != trimmed {
+                anyhow::bail!("client_access.subscription_server 包含无效地址");
             }
             validate_client_endpoint(trimmed)?;
-            if !unique.insert(trimmed) {
-                anyhow::bail!("client_access.server 包含重复地址");
+        }
+        let mut unique = HashSet::new();
+        for endpoint in self.effective_traffic_servers() {
+            let trimmed = endpoint.trim();
+            if trimmed.is_empty() || endpoint != trimmed {
+                anyhow::bail!("client_access 包含无效地址");
+            }
+            validate_client_endpoint(trimmed)?;
+            if !unique.insert(trimmed.to_string()) {
+                anyhow::bail!("client_access 包含重复地址");
             }
         }
-        let cert_mode = self.cert_mode.as_str();
-        let valid_fingerprint = cert_mode
-            .strip_prefix("finger:")
-            .is_some_and(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()));
-        if cert_mode != "standard" && cert_mode != "finger" && !valid_fingerprint {
-            anyhow::bail!("client_access.cert_mode 只能是 standard、finger 或 finger:<sha256>");
-        }
         Ok(())
+    }
+
+    pub fn effective_subscription_server(&self) -> String {
+        self.subscription_server.clone()
+    }
+
+    pub fn effective_traffic_servers(&self) -> Vec<String> {
+        self.traffic_servers.clone()
+    }
+
+    pub fn resolved_traffic_servers(&self) -> Vec<String> {
+        let servers = self.effective_traffic_servers();
+        if servers.is_empty() {
+            vec![self.effective_subscription_server()]
+        } else {
+            servers
+        }
     }
 }
 
@@ -423,12 +437,18 @@ pub fn update_client_access_config(
     let table = document["client_access"]
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("client_access 必须是表"))?;
-    let mut servers = Array::new();
-    for endpoint in &config.server {
-        servers.push(endpoint.as_str());
+    table.remove("server");
+    table.remove("cert_mode");
+    insert_value(
+        table,
+        "subscription_server",
+        Value::from(config.effective_subscription_server()),
+    );
+    let mut traffic_servers = Array::new();
+    for endpoint in config.effective_traffic_servers() {
+        traffic_servers.push(endpoint);
     }
-    insert_value(table, "server", Value::Array(servers));
-    insert_value(table, "cert_mode", Value::from(config.cert_mode.clone()));
+    insert_value(table, "traffic_servers", Value::Array(traffic_servers));
     let rendered = document.to_string();
     let parsed: ConfigFile = toml::from_str(&rendered)?;
     parsed.client_access.validate_optional()?;
@@ -648,12 +668,9 @@ mod tests {
             "wss://[2001:db8::1]:29872",
         ] {
             assert!(
-                ClientAccessConfig {
-                    server: vec![endpoint.to_string()],
-                    cert_mode: "finger".to_string(),
-                }
-                .validate()
-                .is_ok()
+                ClientAccessConfig::new(endpoint.to_string(), Vec::new())
+                    .validate()
+                    .is_ok()
             );
         }
         for endpoint in [
@@ -664,14 +681,37 @@ mod tests {
             "tcp://vpn.example.com:29872/path",
         ] {
             assert!(
-                ClientAccessConfig {
-                    server: vec![endpoint.to_string()],
-                    cert_mode: "finger".to_string(),
-                }
-                .validate()
-                .is_err()
+                ClientAccessConfig::new(endpoint.to_string(), Vec::new())
+                    .validate()
+                    .is_err()
             );
         }
+    }
+
+    #[test]
+    fn client_access_serializes_only_subscription_and_traffic_servers() {
+        let access: ClientAccessConfig = toml::from_str(
+            r#"subscription_server = "tcp://control.example.com:29872"
+traffic_servers = ["quic://traffic.example.com:29872"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            access.effective_subscription_server(),
+            "tcp://control.example.com:29872"
+        );
+        assert_eq!(
+            access.effective_traffic_servers(),
+            vec!["quic://traffic.example.com:29872"]
+        );
+        let rendered = toml::to_string(&ClientAccessConfig::new(
+            access.effective_subscription_server(),
+            access.effective_traffic_servers(),
+        ))
+        .unwrap();
+        assert!(rendered.contains("subscription_server"));
+        assert!(rendered.contains("traffic_servers"));
+        assert!(!rendered.contains("cert_mode"));
     }
 
     #[test]

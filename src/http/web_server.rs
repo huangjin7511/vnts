@@ -1,7 +1,7 @@
 use crate::ControlService;
 use crate::managed_config::{
     ManagedClientConfigForm, canonicalize_client_config, canonicalize_stored_client_config,
-    editable_client_config, issue_subscription, managed_config_semantically_equal,
+    editable_client_config, issue_subscription, managed_config_semantically_equal, new_join_id,
     resolve_cert_mode, validate_managed_advanced_config,
 };
 use crate::server::control_server::db::{
@@ -992,6 +992,10 @@ struct ManagedConfigVO {
     overridden_fields: Vec<String>,
     updated_at: i64,
     subscription_issued: bool,
+    subscription_server: String,
+    traffic_servers_override: Option<Vec<String>>,
+    inherits_traffic_servers: bool,
+    effective_traffic_servers: Vec<String>,
     client_config: ManagedClientConfigForm,
 }
 
@@ -1002,6 +1006,7 @@ impl ManagedConfigVO {
     fn from_record(
         value: ManagedConfigRecord,
         live: Option<SubscriptionLiveState>,
+        default_subscription_server: String,
     ) -> Self {
         let subscription_issued = value.credential_key.is_some();
         let client_config =
@@ -1026,6 +1031,13 @@ impl ManagedConfigVO {
                 Vec::new(),
             ),
         };
+        let effective_traffic_servers = client_config.servers();
+        let traffic_servers_override = value.traffic_servers_override.clone();
+        let subscription_server = if value.subscription_server.is_empty() {
+            default_subscription_server
+        } else {
+            value.subscription_server.clone()
+        };
         Self {
             network_code: value.network_code,
             device_id: value.device_id,
@@ -1038,6 +1050,10 @@ impl ManagedConfigVO {
             overridden_fields,
             updated_at: value.updated_at,
             subscription_issued,
+            subscription_server,
+            inherits_traffic_servers: traffic_servers_override.is_none(),
+            traffic_servers_override,
+            effective_traffic_servers,
             client_config,
         }
     }
@@ -1059,13 +1075,24 @@ struct SubscriptionResponse {
 #[derive(Debug, Deserialize)]
 struct ManagedConfigRequest {
     config_toml: Option<String>,
+    subscription_server: Option<String>,
     current_server: Option<String>,
     other_servers: Option<Vec<String>>,
-    cert_mode: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_traffic_override")]
+    traffic_servers_override: Option<Option<Vec<String>>>,
     client_config: Option<ManagedClientConfigForm>,
     device_name: Option<String>,
     ip: Option<String>,
     ip_type: Option<DeviceIpType>,
+}
+
+fn deserialize_present_traffic_override<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<Vec<String>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Vec<String>>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1077,16 +1104,11 @@ struct CreateManagedDeviceRequest {
     ip_type: Option<DeviceIpType>,
     #[serde(default)]
     config_toml: String,
+    subscription_server: Option<String>,
     current_server: Option<String>,
     other_servers: Option<Vec<String>>,
-    cert_mode: Option<String>,
+    traffic_servers_override: Option<Vec<String>>,
     client_config: Option<ManagedClientConfigForm>,
-}
-
-#[derive(Deserialize)]
-struct ManagedIdentityConfig {
-    server: Vec<String>,
-    cert_mode: String,
 }
 
 fn unix_timestamp() -> i64 {
@@ -1135,34 +1157,16 @@ fn requested_servers(
 
 fn requested_client_access(
     state: &AppState,
-    server: Option<Vec<String>>,
-    cert_mode: Option<String>,
+    subscription_server: Option<String>,
+    traffic_servers: Vec<String>,
 ) -> anyhow::Result<ClientAccessConfig> {
     let defaults = state.client_access.read().clone();
-    let access = ClientAccessConfig {
-        server: server.unwrap_or(defaults.server),
-        cert_mode: cert_mode.unwrap_or(defaults.cert_mode),
-    };
+    let subscription_server = subscription_server
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| defaults.effective_subscription_server());
+    let access = ClientAccessConfig::new(subscription_server, traffic_servers);
     access.validate()?;
     Ok(access)
-}
-
-fn access_from_managed_toml(config_toml: &str) -> anyhow::Result<ClientAccessConfig> {
-    let value: ManagedIdentityConfig = toml::from_str(config_toml)?;
-    Ok(ClientAccessConfig {
-        server: value.server,
-        cert_mode: value.cert_mode,
-    })
-}
-
-fn draft_client_access() -> anyhow::Result<(ClientAccessConfig, String)> {
-    Ok((
-        ClientAccessConfig {
-            server: Vec::new(),
-            cert_mode: "finger".to_string(),
-        },
-        "finger".to_string(),
-    ))
 }
 
 fn new_draft_record(
@@ -1172,17 +1176,22 @@ fn new_draft_record(
     device_name: &str,
     configured_ip: Option<Ipv4Addr>,
     is_fixed_ip: bool,
+    join_id: &str,
 ) -> anyhow::Result<ManagedConfigRecord> {
-    let (access, resolved) = draft_client_access()?;
+    let defaults = state.client_access.read().clone();
+    let access = ClientAccessConfig::new(
+        defaults.effective_subscription_server(),
+        defaults.effective_traffic_servers(),
+    );
+    let resolved = "finger".to_string();
     let config_toml = canonicalize_client_config("", &access, &resolved, device_name, is_fixed_ip)?;
-    let issued = if access.server.is_empty() {
+    let issued = if access.effective_subscription_server().is_empty() {
         None
     } else {
         Some(issue_subscription(
             &access,
             Some(state.certificate_fingerprint.as_str()),
-            network_code,
-            device_id,
+            join_id,
         )?)
     };
     Ok(ManagedConfigRecord {
@@ -1190,8 +1199,11 @@ fn new_draft_record(
         device_id: device_id.to_string(),
         revision: 1,
         config_toml,
+        subscription_server: access.effective_subscription_server(),
+        traffic_servers_override: None,
         credential_key: issued.as_ref().map(|issued| issued.credential_key.clone()),
         subscription: issued.as_ref().map(|issued| issued.subscription.clone()),
+        join_id: join_id.to_string(),
         updated_at: unix_timestamp(),
         configured_device_name: device_name.to_string(),
         configured_ip,
@@ -1201,16 +1213,16 @@ fn new_draft_record(
 
 #[derive(Serialize)]
 struct ClientAccessSettingsVO {
-    server: Vec<String>,
-    cert_mode: String,
+    subscription_server: String,
+    traffic_servers: Vec<String>,
     listener_ports: ClientListenerPorts,
 }
 
 fn client_access_settings(state: &AppState) -> ClientAccessSettingsVO {
     let config = state.client_access.read();
     ClientAccessSettingsVO {
-        server: config.server.clone(),
-        cert_mode: config.cert_mode.clone(),
+        subscription_server: config.effective_subscription_server(),
+        traffic_servers: config.effective_traffic_servers(),
         listener_ports: state.client_listener_ports,
     }
 }
@@ -1227,12 +1239,55 @@ async fn update_client_access(
         return ApiResponse::<()>::err(error.to_string()).into_response();
     }
     let _guard = state.config_update_lock.lock().await;
+    let previous = state.client_access.read().clone();
     let path = state.config_path.as_ref().clone();
     let persisted = body.clone();
     match tokio::task::spawn_blocking(move || persist_client_access_config(&path, &persisted)).await
     {
         Ok(Ok(config)) => {
             *state.client_access.write() = config.clone();
+            if previous.effective_traffic_servers() != config.effective_traffic_servers() {
+                match db::update_inherited_traffic_servers(
+                    &config.effective_traffic_servers(),
+                    &config.effective_subscription_server(),
+                    unix_timestamp(),
+                )
+                .await
+                {
+                    Ok(records) => {
+                        for record in records {
+                            if let Err(error) = state
+                                .control_service
+                                .push_subscription_config(&record)
+                                .await
+                            {
+                                log::warn!(
+                                    "推送继承流量服务器的设备 {}/{} 失败: {error:#}",
+                                    record.network_code,
+                                    record.device_id
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        *state.client_access.write() = previous.clone();
+                        let rollback_path = state.config_path.as_ref().clone();
+                        let rollback = previous.clone();
+                        if let Err(rollback_error) = tokio::task::spawn_blocking(move || {
+                            persist_client_access_config(&rollback_path, &rollback)
+                        })
+                        .await
+                        .unwrap_or_else(|join_error| Err(join_error.into()))
+                        {
+                            log::error!(
+                                "继承设备事务失败后恢复 client_access 配置也失败: {rollback_error:#}"
+                            );
+                        }
+                        return ApiResponse::<()>::err(format!("更新继承设备失败: {error}"))
+                            .into_response();
+                    }
+                }
+            }
             ApiResponse::ok(client_access_settings(&state)).into_response()
         }
         Ok(Err(error)) => ApiResponse::<()>::err(format!("保存配置失败: {error}")).into_response(),
@@ -1249,32 +1304,33 @@ async fn create_managed_device(
         Err(_) => return ApiResponse::<()>::err("无效的 IP 地址").into_response(),
     };
     let ip_type = body.ip_type.unwrap_or(DeviceIpType::Dynamic);
-    let form_access = body
+    let form_traffic_servers = body
         .client_config
         .as_ref()
-        .map(|form| (form.servers(), form.cert_mode.clone()));
-    let request_server = match requested_servers(body.current_server, body.other_servers) {
-        Ok(value) => value.or_else(|| form_access.as_ref().map(|value| value.0.clone())),
+        .map(ManagedClientConfigForm::servers);
+    let request_traffic_servers = match requested_servers(body.current_server, body.other_servers) {
+        Ok(value) => value.or(form_traffic_servers),
         Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
     };
-    let Some(request_server) = request_server else {
-        return ApiResponse::<()>::err("当前服务器地址不能为空").into_response();
-    };
+    let traffic_override = body
+        .traffic_servers_override
+        .clone()
+        .or(request_traffic_servers);
+    let effective_traffic_servers = traffic_override
+        .clone()
+        .unwrap_or_else(|| state.client_access.read().effective_traffic_servers());
     let access = match requested_client_access(
         &state,
-        Some(request_server),
-        body.cert_mode.or_else(|| form_access.map(|value| value.1)),
+        body.subscription_server.clone(),
+        effective_traffic_servers,
     ) {
         Ok(access) => access,
         Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
     };
-    let resolved_cert_mode =
-        match resolve_cert_mode(&access, Some(state.certificate_fingerprint.as_str())) {
-            Ok(value) => value,
-            Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
-        };
-    let mut stored_access = access.clone();
-    stored_access.cert_mode = resolved_cert_mode.clone();
+    let resolved_cert_mode = match resolve_cert_mode(Some(state.certificate_fingerprint.as_str())) {
+        Ok(value) => value,
+        Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+    };
     let editable_toml = match body.client_config.as_ref() {
         Some(form) => match form.merge_into_toml(&body.config_toml) {
             Ok(value) => value,
@@ -1289,7 +1345,7 @@ async fn create_managed_device(
     }
     let config_toml = match canonicalize_client_config(
         &editable_toml,
-        &stored_access,
+        &access,
         &resolved_cert_mode,
         &body.device_name,
         ip_type == DeviceIpType::Fixed,
@@ -1297,11 +1353,11 @@ async fn create_managed_device(
         Ok(value) => value,
         Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
     };
+    let join_id = new_join_id();
     let issued = match issue_subscription(
-        &stored_access,
+        &access,
         Some(state.certificate_fingerprint.as_str()),
-        &body.network_code,
-        &body.device_id,
+        &join_id,
     ) {
         Ok(value) => value,
         Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
@@ -1330,8 +1386,11 @@ async fn create_managed_device(
         device_id: body.device_id.clone(),
         revision: 1,
         config_toml,
+        subscription_server: access.effective_subscription_server(),
+        traffic_servers_override: traffic_override,
         credential_key: Some(issued.credential_key.clone()),
         subscription: Some(issued.subscription.clone()),
+        join_id,
         updated_at: unix_timestamp(),
         configured_device_name: body.device_name,
         configured_ip: Some(ip),
@@ -1357,14 +1416,15 @@ async fn create_managed_device(
 }
 
 /// Builds the editor VO, attaching the device's live subscription sync state.
-async fn managed_config_vo_for(
-    state: &AppState,
-    record: &ManagedConfigRecord,
-) -> ManagedConfigVO {
+async fn managed_config_vo_for(state: &AppState, record: &ManagedConfigRecord) -> ManagedConfigVO {
     let live = state
         .control_service
         .subscription_live_state(&record.network_code, &record.device_id);
-    ManagedConfigVO::from_record(record.clone(), live)
+    ManagedConfigVO::from_record(
+        record.clone(),
+        live,
+        state.client_access.read().effective_subscription_server(),
+    )
 }
 
 async fn get_managed_device_config(
@@ -1372,8 +1432,9 @@ async fn get_managed_device_config(
     Path((network_code, device_id)): Path<(String, String)>,
 ) -> Response {
     match db::get_managed_config(&network_code, &device_id).await {
-        Ok(Some(record)) => ApiResponse::ok(managed_config_vo_for(&state, &record).await)
-            .into_response(),
+        Ok(Some(record)) => {
+            ApiResponse::ok(managed_config_vo_for(&state, &record).await).into_response()
+        }
         Ok(None) => {
             let device = match state
                 .control_service
@@ -1396,13 +1457,15 @@ async fn get_managed_device_config(
                 &device.device_name,
                 device.ip.as_deref().and_then(|ip| ip.parse().ok()),
                 device.ip_type == DeviceIpType::Fixed,
+                &new_join_id(),
             ) {
                 Ok(value) => value,
                 Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
             };
             match db::create_managed_config(&record).await {
-                Ok(()) => ApiResponse::ok(managed_config_vo_for(&state, &record).await)
-                    .into_response(),
+                Ok(()) => {
+                    ApiResponse::ok(managed_config_vo_for(&state, &record).await).into_response()
+                }
                 Err(error) => ApiResponse::<()>::err(error.to_string()).into_response(),
             }
         }
@@ -1451,43 +1514,48 @@ async fn put_managed_device_config(
     let base_changed = Some(target_ip) != old_ip
         || target_ip_type != device.ip_type
         || target_device_name != device.device_name;
-    let form_access = body
+    let form_traffic_servers = body
         .client_config
         .as_ref()
-        .map(|form| (form.servers(), form.cert_mode.clone()));
-    let request_server = match requested_servers(body.current_server, body.other_servers) {
-        Ok(value) => value.or_else(|| form_access.as_ref().map(|value| value.0.clone())),
+        .map(ManagedClientConfigForm::servers);
+    let request_traffic_servers = match requested_servers(body.current_server, body.other_servers) {
+        Ok(value) => value.or(form_traffic_servers),
         Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
     };
-    let request_cert_mode = body.cert_mode.or_else(|| form_access.map(|value| value.1));
-    let existing_access = current
-        .as_ref()
-        .and_then(|record| access_from_managed_toml(&record.config_toml).ok())
-        .filter(|access| !access.server.is_empty());
-    let server =
-        request_server.or_else(|| existing_access.as_ref().map(|value| value.server.clone()));
-    let Some(server) = server else {
-        return ApiResponse::<()>::err("当前服务器地址不能为空").into_response();
+    let traffic_servers_override = body.traffic_servers_override.clone().unwrap_or_else(|| {
+        request_traffic_servers.map(Some).unwrap_or_else(|| {
+            current
+                .as_ref()
+                .and_then(|record| record.traffic_servers_override.clone())
+        })
+    });
+    let defaults = state.client_access.read().clone();
+    let effective_traffic_servers = traffic_servers_override
+        .clone()
+        .unwrap_or_else(|| defaults.effective_traffic_servers());
+    let requested_subscription_server = match body.subscription_server.as_deref() {
+        Some(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
+        Some(_) => None,
+        None => current
+            .as_ref()
+            .map(|record| record.subscription_server.clone())
+            .filter(|value| !value.is_empty()),
     };
-    let access = ClientAccessConfig {
-        server,
-        cert_mode: request_cert_mode
-            .or_else(|| existing_access.map(|value| value.cert_mode))
-            .unwrap_or_else(|| "finger".to_string()),
-    };
+    let access = ClientAccessConfig::new(
+        requested_subscription_server.unwrap_or_else(|| defaults.effective_subscription_server()),
+        effective_traffic_servers,
+    );
     if let Err(error) = access.validate() {
         return ApiResponse::<()>::err(error.to_string()).into_response();
     };
-    let resolved = if access.server.is_empty() {
+    let resolved = if access.effective_subscription_server().is_empty() {
         "standard".to_string()
     } else {
-        match resolve_cert_mode(&access, Some(state.certificate_fingerprint.as_str())) {
+        match resolve_cert_mode(Some(state.certificate_fingerprint.as_str())) {
             Ok(value) => value,
             Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
         }
     };
-    let mut stored_access = access;
-    stored_access.cert_mode = resolved.clone();
     let base_source = body.config_toml.as_deref().unwrap_or_else(|| {
         current
             .as_ref()
@@ -1513,7 +1581,7 @@ async fn put_managed_device_config(
     let fixed_ip = (target_ip_type == DeviceIpType::Fixed).then_some(target_ip);
     let normalized = match canonicalize_client_config(
         source,
-        &stored_access,
+        &access,
         &resolved,
         &target_device_name,
         fixed_ip.is_some(),
@@ -1526,6 +1594,7 @@ async fn put_managed_device_config(
             &current.config_toml,
             &current.configured_device_name,
             current.fixed_ip.is_some(),
+            Some(current.subscription_server.as_str()).filter(|value| !value.trim().is_empty()),
         ) {
             Ok(value) => value,
             Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
@@ -1558,6 +1627,12 @@ async fn put_managed_device_config(
     }
 
     let persist_result: anyhow::Result<(ManagedConfigRecord, bool)> = async {
+        // 编辑时为空的设备补赋 join_id；已赋值则原样沿用
+        let join_id = current
+            .as_ref()
+            .map(|record| record.join_id.clone())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(new_join_id);
         if let Some(current) = current.as_ref() {
             let semantic_equal = managed_config_semantically_equal(
                 previous.as_deref().unwrap_or_default(),
@@ -1566,7 +1641,10 @@ async fn put_managed_device_config(
             // Device-table IP is envelope metadata rather than TOML. It still
             // changes the effective managed configuration and therefore must
             // advance the revision for every allocation type.
-            if semantic_equal && !base_changed {
+            let traffic_changed = current.traffic_servers_override != traffic_servers_override;
+            let subscription_changed =
+                current.subscription_server != access.effective_subscription_server();
+            if semantic_equal && !base_changed && !traffic_changed && !subscription_changed {
                 if current.config_toml == normalized {
                     Ok((current.clone(), false))
                 } else {
@@ -1574,6 +1652,7 @@ async fn put_managed_device_config(
                         &network_code,
                         &device_id,
                         &normalized,
+                        &join_id,
                         unix_timestamp(),
                     )
                     .await?
@@ -1581,10 +1660,18 @@ async fn put_managed_device_config(
                     .ok_or_else(|| anyhow::anyhow!("设备未启用服务端管理"))
                 }
             } else {
-                db::update_managed_config(&network_code, &device_id, &normalized, unix_timestamp())
-                    .await?
-                    .map(|record| (record, true))
-                    .ok_or_else(|| anyhow::anyhow!("设备未启用服务端管理"))
+                db::update_managed_config_with_endpoints(
+                    &network_code,
+                    &device_id,
+                    &normalized,
+                    &access.effective_subscription_server(),
+                    traffic_servers_override.as_deref(),
+                    &join_id,
+                    unix_timestamp(),
+                )
+                .await?
+                .map(|record| (record, true))
+                .ok_or_else(|| anyhow::anyhow!("设备未启用服务端管理"))
             }
         } else {
             let record = ManagedConfigRecord {
@@ -1592,8 +1679,11 @@ async fn put_managed_device_config(
                 device_id: device_id.clone(),
                 revision: 1,
                 config_toml: normalized.clone(),
+                subscription_server: access.effective_subscription_server(),
+                traffic_servers_override: traffic_servers_override.clone(),
                 credential_key: None,
                 subscription: None,
+                join_id,
                 updated_at: unix_timestamp(),
                 configured_device_name: target_device_name.clone(),
                 configured_ip: Some(target_ip),
@@ -1668,6 +1758,11 @@ async fn issue_missing_subscription(
         Ok(None) => return ApiResponse::<()>::err_code(404, "设备不存在").into_response(),
         Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
     };
+    // 老设备可能没有 join_id：签发前补齐（已赋值则原样沿用）
+    let join_id = match db::ensure_join_id(&network_code, &device_id).await {
+        Ok(value) => value,
+        Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
+    };
     let (mut record, record_exists) = match db::get_managed_config(&network_code, &device_id).await
     {
         Ok(Some(value)) => (value, true),
@@ -1678,28 +1773,35 @@ async fn issue_missing_subscription(
             &device.device_name,
             device.ip.as_deref().and_then(|ip| ip.parse().ok()),
             device.ip_type == DeviceIpType::Fixed,
+            &join_id,
         ) {
             Ok(value) => (value, false),
             Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
         },
         Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
     };
-    let access = match access_from_managed_toml(&record.config_toml)
-        .ok()
-        .filter(|access| !access.server.is_empty())
-    {
-        Some(value) => value,
-        None => return ApiResponse::<()>::err("请先配置当前服务器地址").into_response(),
-    };
-    let resolved = match resolve_cert_mode(&access, Some(state.certificate_fingerprint.as_str())) {
+    let defaults = state.client_access.read().clone();
+    let access = ClientAccessConfig::new(
+        if record.subscription_server.is_empty() {
+            defaults.effective_subscription_server()
+        } else {
+            record.subscription_server.clone()
+        },
+        record
+            .traffic_servers_override
+            .clone()
+            .unwrap_or_else(|| defaults.effective_traffic_servers()),
+    );
+    if access.effective_subscription_server().is_empty() {
+        return ApiResponse::<()>::err("请先配置订阅服务器地址").into_response();
+    }
+    let resolved = match resolve_cert_mode(Some(state.certificate_fingerprint.as_str())) {
         Ok(value) => value,
         Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
     };
-    let mut stored_access = access.clone();
-    stored_access.cert_mode = resolved.clone();
     let normalized = match canonicalize_client_config(
         &record.config_toml,
-        &stored_access,
+        &access,
         &resolved,
         &device.device_name,
         device.ip_type == DeviceIpType::Fixed,
@@ -1723,6 +1825,7 @@ async fn issue_missing_subscription(
             &network_code,
             &device_id,
             &record.config_toml,
+            &join_id,
             unix_timestamp(),
         )
         .await
@@ -1738,6 +1841,7 @@ async fn issue_missing_subscription(
             &network_code,
             &device_id,
             &record.config_toml,
+            &join_id,
             unix_timestamp(),
         )
         .await
@@ -1752,8 +1856,7 @@ async fn issue_missing_subscription(
     let issued = match issue_subscription(
         &access,
         Some(state.certificate_fingerprint.as_str()),
-        &network_code,
-        &device_id,
+        &join_id,
     ) {
         Ok(value) => value,
         Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
@@ -1763,6 +1866,7 @@ async fn issue_missing_subscription(
         &device_id,
         &issued.credential_key,
         &issued.subscription,
+        &join_id,
         unix_timestamp(),
     )
     .await
@@ -1809,6 +1913,7 @@ async fn get_subscription(
                 &device.device_name,
                 device.ip.as_deref().and_then(|ip| ip.parse().ok()),
                 device.ip_type == DeviceIpType::Fixed,
+                &new_join_id(),
             ) {
                 Ok(record) => record,
                 Err(error) => return ApiResponse::<()>::err(error.to_string()).into_response(),
@@ -2069,9 +2174,10 @@ struct CreateDeviceRequest {
     wireguard_input_routes: Vec<Ikev2InputRoute>,
     #[serde(default)]
     config_toml: String,
+    subscription_server: Option<String>,
     current_server: Option<String>,
     other_servers: Option<Vec<String>>,
-    cert_mode: Option<String>,
+    traffic_servers_override: Option<Vec<String>>,
 }
 
 async fn create_device(
@@ -2095,9 +2201,10 @@ async fn create_device(
                 ip: body.ip,
                 ip_type: Some(ip_type),
                 config_toml: body.config_toml,
+                subscription_server: body.subscription_server,
                 current_server: body.current_server,
                 other_servers: body.other_servers,
-                cert_mode: body.cert_mode,
+                traffic_servers_override: body.traffic_servers_override,
                 client_config: None,
             }),
         )
@@ -2347,7 +2454,8 @@ pub async fn start_http_server(
 
     log::info!("HTTP Server running at http://{}", web_bind);
 
-    let listener = tokio::net::TcpListener::bind(web_bind).await?;
+    let listener =
+        tokio::net::TcpListener::from_std(crate::utils::net::bind_tcp_listener(web_bind)?)?;
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -2428,8 +2536,8 @@ fn build_app(app_state: AppState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, AuthConfig, Claims, ClientListenerPorts, build_app, draft_client_access,
-        normalize_network_codes, requested_servers, resolve_managed_device_ips, safe_static_path,
+        AppState, AuthConfig, Claims, ClientListenerPorts, build_app, normalize_network_codes,
+        requested_servers, resolve_managed_device_ips, safe_static_path,
     };
     use crate::server::control_server::db::{ClientType, DeviceIpType, Ikev2InputRoute};
     use crate::server::control_server::service::ControlService;
@@ -2502,11 +2610,9 @@ mod tests {
     }
 
     #[test]
-    fn unconfigured_device_draft_defaults_to_fingerprint_validation() {
-        let (access, resolved) = draft_client_access().unwrap();
-        assert!(access.server.is_empty());
-        assert_eq!(access.cert_mode, "finger");
-        assert_eq!(resolved, "finger");
+    fn unconfigured_client_access_has_no_subscription_server() {
+        let access = ClientAccessConfig::default();
+        assert!(access.effective_subscription_server().is_empty());
     }
 
     #[test]

@@ -146,8 +146,7 @@ pub async fn start(
             .context("WireGuard 私钥未配置")?,
     )?;
     let socket = Arc::new(
-        UdpSocket::bind(config.bind)
-            .await
+        UdpSocket::from_std(crate::utils::net::bind_udp_socket(config.bind)?)
             .with_context(|| format!("无法绑定 WireGuard UDP 地址 {}", config.bind))?,
     );
     #[cfg(test)]

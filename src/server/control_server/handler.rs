@@ -1,13 +1,15 @@
 use crate::protocol::control_message::{
     ClientSimpleInfoList, ConfirmRegResponseMsg, ErrorResponseMsg, FastRegRequestMsg,
     FastRegResponseMsg, RegResponseMsg, RequestMessage, ResponseMessage, SelectiveBroadcast,
-    SubnetSyncRequest, SubnetSyncResponse, SubscriptionConfigAck,
+    SubnetSyncRequest, SubnetSyncResponse, SubscriptionConfigAck, SubscriptionPing,
 };
 use crate::protocol::ip_packet_protocol::{HEAD_LENGTH, MsgType, NetPacket};
 use crate::protocol::rpc_message::rpc_message_request::RpcReqPayload;
 use crate::protocol::rpc_message::rpc_message_response::RpcResPayload;
 use crate::protocol::rpc_message::{ClientListResponse, RpcMessageRequest, RpcMessageResponse};
-use crate::server::control_server::service::{ControlService, RegistrationStatus, Session};
+use crate::server::control_server::service::{
+    ControlService, RegistrationStatus, Session, SubscriptionControlSession,
+};
 use anyhow::bail;
 use bytes::{Bytes, BytesMut};
 use pnet_packet::icmp::echo_request::EchoRequestPacket;
@@ -23,6 +25,7 @@ pub struct ControlHandler {
     addr: SocketAddr,
     sender: WeakSender<Bytes>,
     session: Option<Session>,
+    subscription_session: Option<SubscriptionControlSession>,
 }
 
 impl ControlHandler {
@@ -36,11 +39,12 @@ impl ControlHandler {
             addr,
             sender,
             session: None,
+            subscription_session: None,
         }
     }
 
     pub async fn handle_reg(&mut self, buf: &[u8]) -> anyhow::Result<()> {
-        if self.session.is_some() {
+        if self.session.is_some() || self.subscription_session.is_some() {
             bail!("Session is already active");
         }
         let request = RequestMessage::from_slice(buf)?;
@@ -49,6 +53,24 @@ impl ControlHandler {
         };
         let reg = match request {
             RequestMessage::Reg(reg) => reg,
+            RequestMessage::SubscriptionRegister(request) => {
+                let response = match self
+                    .control_service
+                    .register_subscription_connection(request, sender.clone())
+                    .await
+                {
+                    Ok((config, session)) => {
+                        self.subscription_session = Some(session);
+                        ResponseMessage::SubscriptionRegister(config)
+                    }
+                    Err(error) => ResponseMessage::Error(ErrorResponseMsg {
+                        code: 403,
+                        message: error.to_string(),
+                    }),
+                };
+                sender.send(Bytes::from(response.encode())).await?;
+                return Ok(());
+            }
             RequestMessage::SubscriptionConfig(request) => {
                 let response = match self
                     .control_service
@@ -103,8 +125,8 @@ impl ControlHandler {
             gateway: session.network_state.gateway(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             subnet_sync_supported: true,
-            subscription_config_supported: true,
-            subscription: session.subscription_server_proof.clone(),
+            subscription_config_supported: false,
+            subscription: None,
             server_instance_id: self.control_service.server_instance_id(),
             multi_link_supported: true,
         };
@@ -368,6 +390,32 @@ impl ControlHandler {
     }
 
     pub async fn handle_data(&mut self, buf: BytesMut) -> anyhow::Result<()> {
+        if let Some(subscription) = self.subscription_session.as_ref() {
+            let Some(sender) = self.sender.upgrade() else {
+                bail!("Sender is already dropped");
+            };
+            match RequestMessage::from_slice(&buf)? {
+                RequestMessage::SubscriptionAck(ack) => {
+                    self.control_service
+                        .acknowledge_subscription_config(
+                            &subscription.identity.0,
+                            &subscription.identity.1,
+                            subscription.random_id,
+                            ack,
+                        )
+                        .await?;
+                }
+                RequestMessage::SubscriptionPing(SubscriptionPing { nonce }) => {
+                    sender
+                        .send(Bytes::from(
+                            ResponseMessage::SubscriptionPong(SubscriptionPing { nonce }).encode(),
+                        ))
+                        .await?;
+                }
+                _ => bail!("unexpected message on subscription control connection"),
+            }
+            return Ok(());
+        }
         let Some(session) = self.session.as_mut() else {
             bail!("Session is not active");
         };
